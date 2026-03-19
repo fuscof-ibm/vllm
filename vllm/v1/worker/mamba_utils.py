@@ -69,6 +69,7 @@ class MambaCopyBuffers:
     sizes: CpuGpuBuffer
     mamba_group_ids: list[int]
     mamba_spec: MambaSpec
+    _kv_cache_config: "KVCacheConfig"
     offset: int = 0
 
     @classmethod
@@ -91,6 +92,7 @@ class MambaCopyBuffers:
             sizes=make_buffer(n, dtype=torch.int32),
             mamba_group_ids=mamba_group_ids,
             mamba_spec=mamba_spec,
+            _kv_cache_config=kv_cache_config,
         )
 
 
@@ -159,6 +161,7 @@ def preprocess_mamba(
     Copy the mamba state of previous step to the last
     (1 + num_speculative_blocks) block.
     """
+    assert copy_bufs._kv_cache_config is kv_cache_config, "Inconsistent KVCacheConfig"
     mamba_group_ids = copy_bufs.mamba_group_ids
     mamba_spec = copy_bufs.mamba_spec
     num_speculative_blocks = mamba_spec.num_speculative_blocks
@@ -233,6 +236,7 @@ def postprocess_mamba(
     If a blocks is converted from partial block to full block in this step, copy the
     state from the block for running state to the new full block.
     """
+    assert copy_bufs._kv_cache_config is kv_cache_config, "Inconsistent KVCacheConfig"
     num_scheduled_tokens_dict = scheduler_output.num_scheduled_tokens
     scheduled_spec_decode_tokens_dict = scheduler_output.scheduled_spec_decode_tokens
     num_accepted_tokens_cpu = input_batch.num_accepted_tokens_cpu

@@ -35,8 +35,10 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
     """
     spec = MagicMock(block_size=64, num_speculative_blocks=0)
     cache_config = MagicMock(enable_prefix_caching=True)
+    kv_cache_config = MagicMock()
     input_batch = MagicMock(req_ids=[])
-    copy_bufs = MagicMock(mamba_group_ids=[0], mamba_spec=spec)
+    copy_bufs = MagicMock(mamba_group_ids=[0], mamba_spec=spec,
+                          _kv_cache_config=kv_cache_config)
 
     mamba_state_idx = {
         "finished": 1,
@@ -56,7 +58,7 @@ def test_resumed_req_ids_cleared_from_mamba_state_idx():
     ):
         preprocess_mamba(
             sched,
-            MagicMock(),
+            kv_cache_config,
             cache_config,
             mamba_state_idx,
             input_batch,
