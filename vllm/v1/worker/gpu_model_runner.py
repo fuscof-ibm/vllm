@@ -712,6 +712,14 @@ class GPUModelRunner(
             self.max_num_reqs, dtype=torch.int32
         )
 
+        # Mamba state index for hybrid models - tracks which block contains
+        # the running mamba state. -1 means "no previous state" (new/resumed
+        # request). Uses CpuGpuBuffer like num_accepted_tokens.
+        self.mamba_state_idx = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
+        # Initialize to -1 (sentinel for "no previous state")
+        self.mamba_state_idx.np.fill(-1)
+        self.mamba_state_idx.gpu.fill_(-1)
+
         # Only relevant for multimodal models
         if self.supports_mm_inputs:
             # Double buffer to avoid race condition: previous iteration's async
@@ -3933,6 +3941,12 @@ class GPUModelRunner(
                     self.input_batch.num_accepted_tokens_cpu[:num_reqs]
                 )
                 self.num_accepted_tokens.copy_to_gpu(num_reqs)
+
+                # Sync mamba_state_idx to GPU (similar to num_accepted_tokens).
+                self.mamba_state_idx.np[:num_reqs] = (
+                    self.input_batch.mamba_state_idx_cpu[:num_reqs]
+                )
+                self.mamba_state_idx.copy_to_gpu(num_reqs)
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
