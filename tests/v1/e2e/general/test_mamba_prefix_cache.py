@@ -30,7 +30,7 @@ from vllm.v1.worker import mamba_utils
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
-from vllm.v1.worker.mamba_utils import get_mamba_groups
+from vllm.v1.worker.mamba_utils import MambaGPUContext, get_mamba_groups
 
 
 @dataclass
@@ -194,6 +194,7 @@ def get_fake_allocate_slots_fn(original_allocate_slots_fn: Callable):
 
 
 mamba_kv_cache_dict = {}
+gpu_kernel_call_count = 0
 
 
 def get_fake_execute_model_fn(original_execute_model_fn: Callable):
@@ -389,6 +390,20 @@ def get_fake_process_mamba_fn(
     return fake_preprocess_mamba_fn, fake_post_process_mamba_fn, fake_copy_fn
 
 
+def get_fake_gpu_postprocess_fn(original_fn: Callable):
+    """Wrapper for MambaGPUContext.run_fused_postprocess to track GPU kernel calls."""
+
+    def fake_run_fused_postprocess(self, *args, **kwargs):
+        global gpu_kernel_call_count
+        gpu_kernel_call_count += 1
+        print(
+            f"GPU kernel run_fused_postprocess called! Count: {gpu_kernel_call_count}"
+        )
+        return original_fn(self, *args, **kwargs)
+
+    return fake_run_fused_postprocess
+
+
 def run_ref_mamba_state_in_subprocess() -> None:
     ctx = mp.get_context("spawn")
     proc = ctx.Process(target=_run_ref_mamba_state_worker)
@@ -509,11 +524,24 @@ def apply_patch(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(mamba_utils, "postprocess_mamba", fake_post_process_mamba_fn)
     monkeypatch.setattr(mamba_utils, "do_mamba_copy_block", fake_copy_fn)
 
+    # Patch GPU kernel to track calls
+    fake_gpu_postprocess_fn = get_fake_gpu_postprocess_fn(
+        MambaGPUContext.run_fused_postprocess
+    )
+    monkeypatch.setattr(
+        MambaGPUContext, "run_fused_postprocess", fake_gpu_postprocess_fn
+    )
+
 
 @create_new_process_for_each_test()
 def test_mamba_prefix_cache(monkeypatch: pytest.MonkeyPatch):
     run_ref_mamba_state_in_subprocess()
     apply_patch(monkeypatch)
+
+    # Reset GPU kernel call counter
+    global gpu_kernel_call_count
+    gpu_kernel_call_count = 0
+
     prompt_dataset = datasets.load_dataset("heheda/a_long_article")
     full_prompt = prompt_dataset["train"][0]["text"]
     tests = {
@@ -803,3 +831,10 @@ def test_mamba_prefix_cache(monkeypatch: pytest.MonkeyPatch):
     del engine
     torch.accelerator.empty_cache()
     cleanup_dist_env_and_memory()
+
+    # Verify GPU kernel was actually called
+    print(f"Total GPU kernel calls: {gpu_kernel_call_count}")
+    assert gpu_kernel_call_count > 0, (
+        "GPU kernel run_fused_postprocess was never called! "
+        "The test is not exercising the GPU postprocess path."
+    )
