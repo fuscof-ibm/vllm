@@ -29,7 +29,7 @@ def postprocess_mamba_fused_kernel(
     num_draft_tokens_ptr,
     # Block table (per-request, per-block) - shape [max_reqs, max_blocks]
     block_table_ptr,
-    block_table_stride_req: tl.constexpr,  # stride between requests
+    block_table_stride_req: tl.int64,  # stride between requests
     # Mamba state metadata (per-layer, per-state-type)
     # These are 1D arrays indexed by (layer_idx * num_state_types + state_type_idx)
     state_base_addrs_ptr,  # base address of each state tensor
@@ -93,11 +93,10 @@ def postprocess_mamba_fused_kernel(
     state_inner_size = tl.load(state_inner_sizes_ptr + state_idx)
     conv_width = tl.load(state_conv_widths_ptr + state_idx)
 
-    # Load block IDs from block table (explicitly cast to int32 pointer to match
-    # block table dtype and ensure correct pointer arithmetic)
-    block_table_base = (block_table_ptr + req_idx * block_table_stride_req).to(
-        tl.pointer_type(tl.int32)
-    )
+    # Load block IDs from block table. Cast to typed pointer BEFORE arithmetic
+    # to ensure element-wise (not byte-wise) pointer advancement.
+    block_table_typed = block_table_ptr.to(tl.pointer_type(tl.int32))
+    block_table_base = block_table_typed + req_idx * block_table_stride_req
     src_block_id = tl.load(block_table_base + src_block_idx)
     dest_block_id = tl.load(block_table_base + dest_block_idx)
 
