@@ -880,6 +880,12 @@ class GPUModelRunner(
         # Note: mamba_state_idx is now stored in input_batch.mamba_state_idx_cpu
         # as a tensor indexed by req_index, not a dict keyed by req_id.
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+        # Event to synchronize mamba input buffer copies (copy_to_gpu) with the
+        # GPU postprocess kernel. The copies happen in execute_model before the
+        # forward pass, and the kernel runs in _update_states_after_model_execute.
+        self.mamba_input_buffers_event: torch.Event | None = None
+        if self.model_config.is_hybrid:
+            self.mamba_input_buffers_event = torch.Event()
         self.layerwise_nvtx_hooks_registered = False
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -1560,14 +1566,14 @@ class GPUModelRunner(
                     accept.tolist(),
                 )
 
-            # CRITICAL: Synchronize to ensure kernel input buffers are ready.
+            # Synchronize on mamba input buffer copies before running kernel.
             # The input tensors (mamba_state_idx, num_scheduled_tokens, etc.)
-            # are copied to GPU with non_blocking=True earlier in the pipeline.
-            # Without this sync, the Triton kernel may read stale data if
-            # those async copies haven't completed yet.
-            # TODO: Investigate why stream ordering isn't sufficient here -
-            # possibly CUDA graph capture or multi-stream issues.
-            torch.accelerator.synchronize()
+            # are copied to GPU with non_blocking=True in execute_model.
+            # We must wait for these copies to complete before the kernel
+            # reads from them. Using an event is more efficient than full
+            # device synchronization.
+            if self.mamba_input_buffers_event is not None:
+                self.mamba_input_buffers_event.synchronize()
 
             # Run fused GPU postprocess.
             ctx.run_fused_postprocess(
@@ -4139,6 +4145,12 @@ class GPUModelRunner(
                 self.num_scheduled_tokens_buf.copy_to_gpu(num_reqs)
                 self.num_computed_tokens_buf.copy_to_gpu(num_reqs)
                 self.num_draft_tokens_buf.copy_to_gpu(num_reqs)
+
+                # Record event after all mamba input buffer copies complete.
+                # This event is synchronized before the GPU postprocess kernel
+                # in _update_states_after_model_execute to ensure buffers are ready.
+                if self.mamba_input_buffers_event is not None:
+                    self.mamba_input_buffers_event.record()
 
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
