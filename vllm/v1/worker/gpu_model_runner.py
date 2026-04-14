@@ -1506,6 +1506,60 @@ class GPUModelRunner(
                 mamba_group_id
             ].get_device_tensor(num_reqs)
 
+            # DEBUG: Validate GPU inputs match CPU state before kernel call.
+            # This helps identify synchronization issues causing accuracy problems.
+            # TODO: Remove this debug block once the accuracy issue is resolved.
+            _DEBUG_MAMBA_POSTPROCESS = False
+            if _DEBUG_MAMBA_POSTPROCESS:
+                import numpy as np
+
+                torch.accelerator.synchronize()
+                # 1. Validate mamba_state_idx sync
+                mamba_idx_cpu = self.input_batch.mamba_state_idx_cpu[:num_reqs]
+                mamba_idx_gpu = self.mamba_state_idx.gpu[:num_reqs].cpu().numpy()
+                if not np.array_equal(mamba_idx_cpu, mamba_idx_gpu):
+                    logger.error(
+                        "mamba_state_idx MISMATCH! CPU=%s, GPU=%s",
+                        mamba_idx_cpu.tolist(),
+                        mamba_idx_gpu.tolist(),
+                    )
+                # 2. Validate num_computed_tokens sync
+                computed_gpu = self.num_computed_tokens_buf.gpu[:num_reqs].cpu().numpy()
+                for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                    expected = self.requests[req_id].num_computed_tokens
+                    if computed_gpu[i] != expected:
+                        logger.error(
+                            "num_computed_tokens MISMATCH for %s! GPU=%d, exp=%d",
+                            req_id,
+                            computed_gpu[i],
+                            expected,
+                        )
+                # 3. Validate block table sync
+                block_table_cpu = self.input_batch.block_table[
+                    mamba_group_id
+                ].get_numpy_array()[:num_reqs]
+                block_table_gpu_check = block_table_gpu.cpu().numpy()
+                if not np.array_equal(block_table_cpu, block_table_gpu_check):
+                    logger.error(
+                        "block_table MISMATCH! CPU shape=%s, GPU shape=%s",
+                        block_table_cpu.shape,
+                        block_table_gpu_check.shape,
+                    )
+                # 4. Log inputs for analysis
+                sched = self.num_scheduled_tokens_buf.gpu[:num_reqs].cpu()
+                draft = self.num_draft_tokens_buf.gpu[:num_reqs].cpu()
+                accept = self.num_accepted_tokens.gpu[:num_reqs].cpu()
+                logger.info(
+                    "[DEBUG] GPU postprocess: reqs=%d, mamba_idx=%s, "
+                    "computed=%s, sched=%s, draft=%s, accept=%s",
+                    num_reqs,
+                    mamba_idx_gpu.tolist(),
+                    computed_gpu.tolist(),
+                    sched.tolist(),
+                    draft.tolist(),
+                    accept.tolist(),
+                )
+
             # Run fused GPU postprocess (no CPU-GPU sync needed).
             ctx.run_fused_postprocess(
                 num_reqs=num_reqs,
@@ -1524,6 +1578,55 @@ class GPUModelRunner(
             self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                 ctx.num_accepted_tokens_out[:num_reqs], non_blocking=True
             )
+
+            # DEBUG: Compare GPU kernel results with CPU path for validation.
+            # Enable this to identify discrepancies between GPU and CPU paths.
+            # WARNING: This is expensive as it runs CPU path redundantly.
+            _DEBUG_COMPARE_GPU_CPU = False
+            if _DEBUG_COMPARE_GPU_CPU and self.execute_model_state is not None:
+                import numpy as np
+
+                torch.accelerator.synchronize()
+                # Save GPU results
+                gpu_accepted_out = ctx.num_accepted_tokens_out[:num_reqs].clone()
+                # Save and restore CPU accepted_tokens for comparison
+                cpu_accepted_backup = self.input_batch.num_accepted_tokens_cpu[
+                    :num_reqs
+                ].copy()
+                # Restore num_accepted from GPU input (before kernel modified it)
+                self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
+                    self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()
+                )
+                # Run CPU postprocess_mamba with scheduler_output from state
+                sched_out = self.execute_model_state.scheduler_output
+                mamba_utils.postprocess_mamba(
+                    sched_out,
+                    self.kv_cache_config,
+                    self.input_batch,
+                    self.requests,
+                    self.compilation_config.static_forward_context,
+                    mamba_copy_funcs,
+                    self._get_mamba_copy_bufs(),
+                )
+                cpu_accepted_out = self.input_batch.num_accepted_tokens_cpu[
+                    :num_reqs
+                ].copy()
+                # Compare results
+                gpu_np = gpu_accepted_out.cpu().numpy()
+                if not np.array_equal(gpu_np, cpu_accepted_out):
+                    logger.error(
+                        "GPU vs CPU num_accepted_tokens MISMATCH! GPU=%s, CPU=%s",
+                        gpu_np.tolist(),
+                        cpu_accepted_out.tolist(),
+                    )
+                else:
+                    logger.info(
+                        "[DEBUG] GPU and CPU paths match: accepted=%s", gpu_np.tolist()
+                    )
+                # Restore original state
+                self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
+                    cpu_accepted_backup
+                )
         else:
             self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                 self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
