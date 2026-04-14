@@ -1571,6 +1571,14 @@ class GPUModelRunner(
                 block_table_gpu=block_table_gpu,
             )
 
+            # CRITICAL: Synchronize to ensure mamba state copies complete.
+            # The kernel performs GPU-side memory copies of mamba state data.
+            # These must finish before the next forward pass reads from the
+            # mamba state tensors. Without this sync, there's a race condition
+            # where the next iteration may read stale/incomplete state data.
+            # TODO: Consider using CUDA events for more fine-grained sync.
+            torch.accelerator.synchronize()
+
             # Copy from ctx.num_accepted_tokens_out which is pre-initialized
             # from num_accepted_tokens_gpu. The kernel only overwrites values
             # to 1 when src_block_idx == dest_block_idx (copy within same block);
