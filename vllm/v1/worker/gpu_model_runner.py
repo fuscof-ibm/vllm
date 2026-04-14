@@ -1560,7 +1560,16 @@ class GPUModelRunner(
                     accept.tolist(),
                 )
 
-            # Run fused GPU postprocess (no CPU-GPU sync needed).
+            # CRITICAL: Synchronize to ensure kernel input buffers are ready.
+            # The input tensors (mamba_state_idx, num_scheduled_tokens, etc.)
+            # are copied to GPU with non_blocking=True earlier in the pipeline.
+            # Without this sync, the Triton kernel may read stale data if
+            # those async copies haven't completed yet.
+            # TODO: Investigate why stream ordering isn't sufficient here -
+            # possibly CUDA graph capture or multi-stream issues.
+            torch.accelerator.synchronize()
+
+            # Run fused GPU postprocess.
             ctx.run_fused_postprocess(
                 num_reqs=num_reqs,
                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
@@ -1570,14 +1579,6 @@ class GPUModelRunner(
                 num_draft_tokens_gpu=self.num_draft_tokens_buf.gpu,
                 block_table_gpu=block_table_gpu,
             )
-
-            # CRITICAL: Synchronize to ensure mamba state copies complete.
-            # The kernel performs GPU-side memory copies of mamba state data.
-            # These must finish before the next forward pass reads from the
-            # mamba state tensors. Without this sync, there's a race condition
-            # where the next iteration may read stale/incomplete state data.
-            # TODO: Consider using CUDA events for more fine-grained sync.
-            torch.accelerator.synchronize()
 
             # Copy from ctx.num_accepted_tokens_out which is pre-initialized
             # from num_accepted_tokens_gpu. The kernel only overwrites values
