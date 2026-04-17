@@ -880,13 +880,6 @@ class GPUModelRunner(
         # Note: mamba_state_idx is now stored in input_batch.mamba_state_idx_cpu
         # as a tensor indexed by req_index, not a dict keyed by req_id.
         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
-        # Event to synchronize GPU postprocess kernel inputs. Recorded after
-        # num_accepted_tokens computation in _update_states_after_model_execute,
-        # which ensures all prior GPU ops complete (input buffer copies from
-        # execute_model, model forward, and num_accepted_tokens computation).
-        self.mamba_input_buffers_event: torch.Event | None = None
-        if self.model_config.is_hybrid:
-            self.mamba_input_buffers_event = torch.Event()
         self.layerwise_nvtx_hooks_registered = False
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -1484,13 +1477,6 @@ class GPUModelRunner(
             .argmax(-1)
         )
 
-        # Record event after num_accepted_tokens computation and all prior
-        # GPU operations (input buffer copies, model forward). This event is
-        # synchronized before the GPU postprocess kernel to ensure all inputs
-        # (including num_accepted_tokens_gpu) are ready.
-        if self.mamba_input_buffers_event is not None:
-            self.mamba_input_buffers_event.record()
-
         if self.cache_config.mamba_cache_mode == "align":
             # Use GPU-based postprocess to avoid CPU-GPU sync.
             # Lazily create the GPU postprocess context on first use.
@@ -1519,15 +1505,6 @@ class GPUModelRunner(
             block_table_gpu = self.input_batch.block_table[
                 mamba_group_id
             ].get_device_tensor(num_reqs)
-
-            # Synchronize to ensure all kernel inputs are ready:
-            # - Input buffers (mamba_state_idx, num_scheduled_tokens, etc.)
-            #   copied with non_blocking=True in execute_model
-            # - num_accepted_tokens_gpu computed above from model output
-            # The event was recorded after num_accepted_tokens computation,
-            # which is ordered after all prior GPU ops on the same stream.
-            if self.mamba_input_buffers_event is not None:
-                self.mamba_input_buffers_event.synchronize()
 
             # Run fused GPU postprocess.
             ctx.run_fused_postprocess(
