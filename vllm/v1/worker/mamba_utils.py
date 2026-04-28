@@ -127,11 +127,13 @@ def postprocess_mamba_fused_kernel(
         dst_addr = state_base_addr + dest_block_id * state_block_stride
         copy_size = state_block_stride
 
-    # Skip copy if src == dst and no offset (no actual data movement needed)
+    # Skip copy if src == dst (no actual data movement needed).
+    # With prefix caching, different logical block indices can map to the
+    # same physical block, so src_addr == dst_addr does NOT imply
+    # src_block_idx == dest_block_idx. Only update num_accepted_tokens
+    # when the logical indices match.
     if src_addr == dst_addr:
-        # Update num_accepted_tokens to 1 for this request
-        # (only one thread should do this)
-        if state_idx == 0:
+        if src_block_idx == dest_block_idx and state_idx == 0:
             tl.store(num_accepted_tokens_out_ptr + req_idx, 1)
         return
 
