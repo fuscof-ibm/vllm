@@ -20,7 +20,7 @@ from vllm.utils.argparse_utils import FlexibleArgumentParser
 from vllm.v1.worker.mamba_utils import batch_memcpy_kernel
 
 BLOCK_SIZES = [128, 256, 512, 1024, 2048]
-COPY_SIZES = [1024, 4096, 16384, 65536, 262144]
+COPY_SIZES = [1024, 4096, 16384, 65536, 262144, 524288, 1048576]
 
 
 def _make_buffers(batch_size: int, copy_size: int, device: str = "cuda"):
