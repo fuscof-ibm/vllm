@@ -1361,3 +1361,170 @@ class TestPostprocessMambaFusedKernel:
             expected_accepted,
             msg="GPU num_accepted_tokens should match Python",
         )
+
+    def test_prefix_caching_shared_block_does_not_set_accepted_to_1(
+        self, device, test_config
+    ):
+        """
+        Regression test: with prefix caching, different logical block indices
+        can map to the same physical block. The kernel must NOT set
+        num_accepted_tokens to 1 in that case.
+
+        When src_block_idx != dest_block_idx but block_table maps both to the
+        same physical block ID, src_addr == dst_addr. The copy is correctly
+        skipped (self-copy is a no-op), but num_accepted_tokens must be
+        preserved — only logical-index equality justifies setting it to 1.
+
+        Test setup (block_size=16):
+        - num_tokens_running_state = 30 + 2 - 0 = 32
+        - new_num_computed = 32 + 3 - 1 = 34
+        - aligned_new_computed = 32
+        - accept_token_bias = 32 - 32 = 0
+        - dest_block_idx = 32 // 16 - 1 = 1
+        - src_block_idx = 0 (set explicitly, != dest_block_idx)
+        - block_ids = [5, 5, ...] — prefix caching: both logical indices
+          map to the same physical block 5
+        """
+        cfg = test_config
+        torch.manual_seed(2001)
+
+        req_ids = ["req_0"]
+        num_computed_tokens = [30]
+        num_scheduled_tokens = {"req_0": 2}
+        num_draft_tokens: dict[str, int] = {}
+        num_accepted_tokens = [3]  # Must stay 3, NOT become 1
+        mamba_state_idx = [0]  # src_block_idx = 0, dest_block_idx will be 1
+
+        # Prefix caching: logical blocks 0 and 1 share physical block 5
+        block_ids_per_req = [[5, 5, 2, 3, 4, 6, 7, 8]]
+
+        layer_names = ["layer_0"]
+        kv_cache_config = _make_kv_cache_config(cfg, layer_names)
+        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
+
+        conv_state_py = torch.randn(
+            cfg.num_blocks,
+            cfg.conv_width,
+            cfg.conv_inner_dim,
+            dtype=cfg.dtype,
+            device=device,
+        )
+        temporal_state_py = torch.randn(
+            cfg.num_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
+        )
+
+        conv_state_gpu = conv_state_py.clone()
+        temporal_state_gpu = temporal_state_py.clone()
+
+        conv_state_orig = conv_state_py.clone()
+        temporal_state_orig = temporal_state_py.clone()
+
+        forward_context_py = {
+            "layer_0": _make_mock_attention(conv_state_py, temporal_state_py)
+        }
+        forward_context_gpu = {
+            "layer_0": _make_mock_attention(conv_state_gpu, temporal_state_gpu)
+        }
+
+        # --- Run Python path ---
+        scheduler_output = _make_postprocess_scheduler_output(
+            req_ids,
+            num_scheduled_tokens,
+            {k: [None] * v for k, v in num_draft_tokens.items() if v > 0},
+        )
+        input_batch_py = _make_input_batch(
+            req_ids, num_accepted_tokens.copy(), mamba_state_idx.copy()
+        )
+        requests = _make_requests(req_ids, num_computed_tokens, block_ids_per_req)
+        copy_bufs = _make_copy_bufs(cfg, kv_cache_config, device)
+
+        postprocess_mamba(
+            scheduler_output,
+            kv_cache_config,
+            input_batch_py,
+            requests,
+            forward_context_py,
+            copy_funcs,
+            copy_bufs,
+        )
+        torch.accelerator.synchronize()
+
+        # --- Run GPU path ---
+        gpu_ctx = MambaGPUContext.create(
+            max_num_reqs=cfg.max_num_reqs,
+            kv_cache_config=kv_cache_config,
+            num_state_types=2,
+            device=device,
+        )
+        gpu_ctx.initialize_from_forward_context(
+            kv_cache_config, forward_context_gpu, copy_funcs
+        )
+
+        num_reqs = len(req_ids)
+        block_table_gpu = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
+        block_table_gpu[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
+
+        gpu_ctx.run_fused_postprocess(
+            num_reqs=num_reqs,
+            num_accepted_tokens_gpu=torch.tensor(
+                num_accepted_tokens, dtype=torch.int32, device=device
+            ),
+            mamba_state_idx_gpu=torch.tensor(
+                mamba_state_idx, dtype=torch.int32, device=device
+            ),
+            num_scheduled_tokens_gpu=torch.tensor(
+                [num_scheduled_tokens[r] for r in req_ids],
+                dtype=torch.int32,
+                device=device,
+            ),
+            num_computed_tokens_gpu=torch.tensor(
+                num_computed_tokens, dtype=torch.int32, device=device
+            ),
+            num_draft_tokens_gpu=torch.tensor(
+                [num_draft_tokens.get(r, 0) for r in req_ids],
+                dtype=torch.int32,
+                device=device,
+            ),
+            block_table_gpu=block_table_gpu,
+        )
+        torch.accelerator.synchronize()
+
+        # --- Verify Python behavior (ground truth) ---
+        # Copy is self-to-self (same physical block), state unchanged
+        torch.testing.assert_close(
+            conv_state_py,
+            conv_state_orig,
+            msg="Python: Conv state should be unchanged (self-copy)",
+        )
+        torch.testing.assert_close(
+            temporal_state_py,
+            temporal_state_orig,
+            msg="Python: Temporal state should be unchanged (self-copy)",
+        )
+        # num_accepted_tokens must NOT be set to 1 (src_block_idx != dest_block_idx)
+        assert input_batch_py.num_accepted_tokens_cpu[0] == num_accepted_tokens[0], (
+            f"Python: num_accepted_tokens should remain {num_accepted_tokens[0]}, "
+            f"got {input_batch_py.num_accepted_tokens_cpu[0]}"
+        )
+
+        # --- Verify GPU matches Python ---
+        torch.testing.assert_close(
+            conv_state_gpu,
+            conv_state_py,
+            msg="GPU conv state should match Python",
+        )
+        torch.testing.assert_close(
+            temporal_state_gpu,
+            temporal_state_py,
+            msg="GPU temporal state should match Python",
+        )
+        expected_accepted = torch.tensor(
+            input_batch_py.num_accepted_tokens_cpu[:num_reqs],
+            dtype=torch.int32,
+            device=device,
+        )
+        torch.testing.assert_close(
+            gpu_ctx.num_accepted_tokens_out[:num_reqs],
+            expected_accepted,
+            msg="GPU num_accepted_tokens should match Python (must NOT be 1)",
+        )
