@@ -1437,7 +1437,9 @@ class GPUModelRunner(
             return None
 
     def _update_states_after_model_execute(
-        self, output_token_ids: torch.Tensor
+        self,
+        output_token_ids: torch.Tensor,
+        scheduler_output: "SchedulerOutput | None" = None,
     ) -> None:
         """Update the cached states after model execution.
 
@@ -1497,6 +1499,16 @@ class GPUModelRunner(
                 mamba_group_id
             ].get_device_tensor(num_reqs)
 
+            # Snapshot mamba states before kernel (for debug validation).
+            pre_kernel_states: dict[str, list[torch.Tensor]] = {}
+            if envs.VLLM_DEBUG_MAMBA_POSTPROCESS:
+                fwd_ctx = self.compilation_config.static_forward_context
+                for layer_name, attn in fwd_ctx.items():
+                    if hasattr(attn, "kv_cache"):
+                        pre_kernel_states[layer_name] = [
+                            s.cpu().clone() for s in attn.kv_cache
+                        ]
+
             # Run fused GPU postprocess.
             ctx.run_fused_postprocess(
                 num_reqs=num_reqs,
@@ -1507,6 +1519,15 @@ class GPUModelRunner(
                 num_draft_tokens_gpu=self.num_draft_tokens_buf.gpu,
                 block_table_gpu=block_table_gpu,
             )
+
+            if envs.VLLM_DEBUG_MAMBA_POSTPROCESS:
+                self._validate_mamba_postprocess(
+                    ctx,
+                    num_reqs,
+                    mamba_copy_funcs,
+                    pre_kernel_states,
+                    scheduler_output,
+                )
 
             # Copy from ctx.num_accepted_tokens_out which is pre-initialized
             # from num_accepted_tokens_gpu. The kernel only overwrites values
@@ -1525,6 +1546,104 @@ class GPUModelRunner(
         # record the event for proper synchronization.
         assert self.num_accepted_tokens_event is not None
         self.num_accepted_tokens_event.record()
+
+    def _validate_mamba_postprocess(
+        self,
+        ctx: "mamba_utils.MambaGPUContext",
+        num_reqs: int,
+        mamba_copy_funcs: tuple,
+        pre_kernel_states: dict[str, list[torch.Tensor]],
+        scheduler_output: "SchedulerOutput | None",
+    ) -> None:
+        """Compare fused kernel output against Python reference (debug only).
+
+        Runs when VLLM_DEBUG_MAMBA_POSTPROCESS=1. Snapshots kernel results,
+        restores pre-kernel state, runs the Python reference, compares
+        num_accepted_tokens and mamba state tensors, then restores kernel
+        results so the production path continues unaffected.
+        """
+        assert scheduler_output is not None, (
+            "VLLM_DEBUG_MAMBA_POSTPROCESS requires scheduler_output"
+        )
+        fwd_ctx = self.compilation_config.static_forward_context
+
+        torch.accelerator.synchronize()
+        kernel_num_accepted = ctx.num_accepted_tokens_out[:num_reqs].cpu().clone()
+
+        kernel_states: dict[str, list[torch.Tensor]] = {}
+        for layer_name, attn in fwd_ctx.items():
+            if hasattr(attn, "kv_cache"):
+                kernel_states[layer_name] = [s.cpu().clone() for s in attn.kv_cache]
+
+        # Restore pre-kernel mamba states.
+        for layer_name, orig_states in pre_kernel_states.items():
+            attn = fwd_ctx[layer_name]
+            for i, s in enumerate(orig_states):
+                attn.kv_cache[i].copy_(s.to(attn.kv_cache[i].device))
+
+        # Set num_accepted_tokens_cpu from GPU (same as old Python path).
+        for i in range(num_reqs):
+            self.input_batch.num_accepted_tokens_cpu[i] = self.num_accepted_tokens.gpu[
+                i
+            ].item()
+
+        copy_bufs = self._get_mamba_copy_bufs()
+        mamba_utils.postprocess_mamba_reference(
+            scheduler_output,
+            self.kv_cache_config,
+            self.input_batch,
+            self.requests,
+            fwd_ctx,
+            mamba_copy_funcs,
+            copy_bufs,
+        )
+        torch.accelerator.synchronize()
+
+        ref_num_accepted = self.input_batch.num_accepted_tokens_cpu[:num_reqs].copy()
+
+        for i in range(num_reqs):
+            if kernel_num_accepted[i].item() != ref_num_accepted[i]:
+                logger.warning(
+                    "MAMBA POSTPROCESS MISMATCH req=%d: "
+                    "kernel_num_accepted=%d ref_num_accepted=%d "
+                    "src_block_idx=%d num_computed=%d "
+                    "num_scheduled=%d num_draft=%d",
+                    i,
+                    kernel_num_accepted[i].item(),
+                    ref_num_accepted[i],
+                    self.mamba_state_idx.np[i],
+                    self.num_computed_tokens_buf.np[i],
+                    self.num_scheduled_tokens_buf.np[i],
+                    self.num_draft_tokens_buf.np[i],
+                )
+
+        for layer_name in kernel_states:
+            attn = fwd_ctx[layer_name]
+            for state_idx, (kern_s, ref_s_gpu) in enumerate(
+                zip(kernel_states[layer_name], attn.kv_cache)
+            ):
+                ref_s = ref_s_gpu.cpu()
+                if not torch.equal(kern_s, ref_s):
+                    diff_blocks = (
+                        (kern_s != ref_s)
+                        .any(dim=tuple(range(1, kern_s.dim())))
+                        .nonzero()
+                    )
+                    logger.warning(
+                        "MAMBA STATE MISMATCH layer=%s state=%d diff_blocks=%s",
+                        layer_name,
+                        state_idx,
+                        diff_blocks.tolist(),
+                    )
+
+        # Restore kernel results so production path continues.
+        for layer_name, kern_state_list in kernel_states.items():
+            attn = fwd_ctx[layer_name]
+            for i, s in enumerate(kern_state_list):
+                attn.kv_cache[i].copy_(s.to(attn.kv_cache[i].device))
+        ctx.num_accepted_tokens_out[:num_reqs].copy_(
+            kernel_num_accepted.to(self.device)
+        )
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
@@ -4259,7 +4378,9 @@ class GPUModelRunner(
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
 
-        self._update_states_after_model_execute(sampler_output.sampled_token_ids)
+        self._update_states_after_model_execute(
+            sampler_output.sampled_token_ids, scheduler_output
+        )
         if self.use_async_scheduling:
             pp = get_pp_group()
             # For torchrun external_launcher PP mode with broadcast_pp_output=True,
