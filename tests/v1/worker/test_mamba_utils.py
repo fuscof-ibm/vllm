@@ -1528,3 +1528,399 @@ class TestPostprocessMambaFusedKernel:
             expected_accepted,
             msg="GPU num_accepted_tokens should match Python (must NOT be 1)",
         )
+
+    def test_prefix_caching_nonsequential_block_ids_boundary(self, device, test_config):
+        """
+        Regression test: non-sequential physical block IDs under prefix caching
+        with the needs_copy boundary at exact equality.
+
+        Under PC, the block allocator assigns physical block IDs in arbitrary
+        order (e.g., [17, 3, 42, 9] instead of [0, 1, 2, 3]). The needs_copy
+        condition is purely token-count based and must evaluate identically
+        regardless of the physical block IDs assigned. This test verifies that
+        the kernel's address arithmetic (block_table lookup, stride computation)
+        produces correct copies when physical IDs are non-sequential.
+
+        Two requests exercise different boundary behaviors:
+        - req_0: aligned_new_computed == num_tokens_running_state (exact boundary)
+          This is the tightest edge: one fewer accepted token and no copy needed.
+        - req_1: aligned_new_computed == num_tokens_running_state (exact boundary)
+          Different block layout, src!=dest, real copy happens.
+
+        Both use non-sequential block IDs typical of PC reuse patterns.
+
+        Test setup (block_size=16):
+        req_0:
+        - num_tokens_running_state = 48 + 0 - 0 = 48
+        - new_num_computed = 48 + 1 - 1 = 48
+        - aligned_new_computed = 48
+        - needs_copy = (48 >= 48) = True (exact boundary!)
+        - accept_token_bias = 48 - 48 = 0
+        - dest_block_idx = 48 // 16 - 1 = 2
+        - src_block_idx = 2 (same as dest -> num_accepted = 1)
+
+        req_1:
+        - num_tokens_running_state = 31 + 1 - 0 = 32
+        - new_num_computed = 32 + 3 - 1 = 34
+        - aligned_new_computed = 32
+        - needs_copy = (32 >= 32) = True (exact boundary!)
+        - accept_token_bias = 32 - 32 = 0
+        - dest_block_idx = 32 // 16 - 1 = 1
+        - src_block_idx = 0 (diff from dest -> num_accepted unchanged)
+        """
+        cfg = test_config
+        torch.manual_seed(4001)
+
+        req_ids = ["req_0", "req_1"]
+        num_computed_tokens = [48, 31]
+        num_scheduled_tokens = {"req_0": 0, "req_1": 1}
+        num_draft_tokens: dict[str, int] = {}
+        num_accepted_tokens = [1, 3]
+        mamba_state_idx = [2, 0]
+
+        # Non-sequential block IDs typical of prefix caching allocation
+        block_ids_per_req = [
+            [17, 3, 42, 9, 25, 11, 30, 2],  # req_0: scattered physical blocks
+            [41, 7, 22, 15, 38, 19, 4, 28],  # req_1: different scattered blocks
+        ]
+
+        layer_names = [f"layer_{i}" for i in range(cfg.num_layers)]
+        # Need enough physical blocks for the scattered IDs
+        num_blocks = 50
+        local_cfg = _TestConfig(num_blocks=num_blocks, max_num_reqs=cfg.max_num_reqs)
+        kv_cache_config = _make_kv_cache_config(local_cfg, layer_names)
+        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
+
+        # Create state tensors
+        conv_states_py = [
+            torch.randn(
+                num_blocks,
+                cfg.conv_width,
+                cfg.conv_inner_dim,
+                dtype=cfg.dtype,
+                device=device,
+            )
+            for _ in range(cfg.num_layers)
+        ]
+        temporal_states_py = [
+            torch.randn(
+                num_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
+            )
+            for _ in range(cfg.num_layers)
+        ]
+
+        conv_states_gpu = [s.clone() for s in conv_states_py]
+        temporal_states_gpu = [s.clone() for s in temporal_states_py]
+
+        forward_context_py = {
+            name: _make_mock_attention(conv_states_py[i], temporal_states_py[i])
+            for i, name in enumerate(layer_names)
+        }
+        forward_context_gpu = {
+            name: _make_mock_attention(conv_states_gpu[i], temporal_states_gpu[i])
+            for i, name in enumerate(layer_names)
+        }
+
+        # --- Run Python path ---
+        scheduler_output = _make_postprocess_scheduler_output(
+            req_ids,
+            num_scheduled_tokens,
+            {k: [None] * v for k, v in num_draft_tokens.items() if v > 0},
+        )
+        input_batch_py = _make_input_batch(
+            req_ids, num_accepted_tokens.copy(), mamba_state_idx.copy()
+        )
+        requests = _make_requests(req_ids, num_computed_tokens, block_ids_per_req)
+        copy_bufs = _make_copy_bufs(local_cfg, kv_cache_config, device)
+
+        postprocess_mamba(
+            scheduler_output,
+            kv_cache_config,
+            input_batch_py,
+            requests,
+            forward_context_py,
+            copy_funcs,
+            copy_bufs,
+        )
+        torch.accelerator.synchronize()
+
+        # --- Run GPU path ---
+        gpu_ctx = MambaGPUContext.create(
+            max_num_reqs=local_cfg.max_num_reqs,
+            kv_cache_config=kv_cache_config,
+            num_state_types=2,
+            device=device,
+        )
+        gpu_ctx.initialize_from_forward_context(
+            kv_cache_config, forward_context_gpu, copy_funcs
+        )
+
+        num_reqs = len(req_ids)
+        max_blocks = max(len(b) for b in block_ids_per_req)
+        block_table_gpu = torch.zeros(
+            num_reqs, max_blocks, dtype=torch.int32, device=device
+        )
+        for i, block_ids in enumerate(block_ids_per_req):
+            block_table_gpu[i, : len(block_ids)] = torch.tensor(
+                block_ids, dtype=torch.int32
+            )
+
+        gpu_ctx.run_fused_postprocess(
+            num_reqs=num_reqs,
+            num_accepted_tokens_gpu=torch.tensor(
+                num_accepted_tokens, dtype=torch.int32, device=device
+            ),
+            mamba_state_idx_gpu=torch.tensor(
+                mamba_state_idx, dtype=torch.int32, device=device
+            ),
+            num_scheduled_tokens_gpu=torch.tensor(
+                [num_scheduled_tokens[r] for r in req_ids],
+                dtype=torch.int32,
+                device=device,
+            ),
+            num_computed_tokens_gpu=torch.tensor(
+                num_computed_tokens, dtype=torch.int32, device=device
+            ),
+            num_draft_tokens_gpu=torch.tensor(
+                [num_draft_tokens.get(r, 0) for r in req_ids],
+                dtype=torch.int32,
+                device=device,
+            ),
+            block_table_gpu=block_table_gpu,
+        )
+        torch.accelerator.synchronize()
+
+        # --- Compare results ---
+        for i in range(cfg.num_layers):
+            torch.testing.assert_close(
+                conv_states_gpu[i],
+                conv_states_py[i],
+                msg=f"Conv state mismatch at layer {i} with non-sequential block IDs",
+            )
+            torch.testing.assert_close(
+                temporal_states_gpu[i],
+                temporal_states_py[i],
+                msg=(
+                    f"Temporal state mismatch at layer {i} "
+                    f"with non-sequential block IDs"
+                ),
+            )
+
+        expected_accepted = torch.tensor(
+            input_batch_py.num_accepted_tokens_cpu[:num_reqs],
+            dtype=torch.int32,
+            device=device,
+        )
+        torch.testing.assert_close(
+            gpu_ctx.num_accepted_tokens_out[:num_reqs],
+            expected_accepted,
+            msg="num_accepted_tokens mismatch with non-sequential block IDs",
+        )
+
+        # Verify req_0 had num_accepted set to 1 (src==dest) and req_1 unchanged
+        assert input_batch_py.num_accepted_tokens_cpu[0] == 1
+        assert input_batch_py.num_accepted_tokens_cpu[1] == num_accepted_tokens[1]
+
+    def test_prefix_caching_mixed_shared_and_distinct_blocks(self, device, test_config):
+        """
+        Regression test: mixed batch under prefix caching where some requests
+        have shared physical blocks (aliased) and others have distinct blocks,
+        with the needs_copy boundary at various positions.
+
+        This tests the interaction between:
+        1. PC block aliasing (src and dest map to same physical block)
+        2. The needs_copy boundary (exact equality vs well-past vs no-copy)
+        3. Non-sequential physical block IDs
+
+        Batch of 4 requests:
+        - req_0: needs_copy=True, src!=dest, shared physical block (PC aliased)
+                 -> copy skipped (src_addr==dst_addr), num_accepted PRESERVED
+        - req_1: needs_copy=True, src!=dest, distinct blocks, non-sequential IDs
+                 -> real copy happens, num_accepted PRESERVED
+        - req_2: needs_copy=False (below boundary)
+                 -> no action at all
+        - req_3: needs_copy=True, src==dest (exact boundary, zero bias)
+                 -> copy skipped (self-copy), num_accepted SET TO 1
+
+        Test setup (block_size=16):
+        req_0: running=30+2-0=32, new=32+3-1=34, aligned=32, 32>=32 -> COPY
+               bias=0, dest=32//16-1=1, src=0 (!=dest)
+               block_ids=[5,5,...] -> same physical -> skip, keep accepted=3
+
+        req_1: running=60+5-2=63, new=63+3-1=65, aligned=64, 64>=63 -> COPY
+               bias=1, dest=64//16-1=3, src=2 (!=dest)
+               block_ids=[41,7,22,15,...] -> distinct -> real copy, keep accepted=3
+
+        req_2: running=30+3-0=33, new=33+1-1=33, aligned=32, 32<33 -> NO COPY
+
+        req_3: running=48+0-0=48, new=48+1-1=48, aligned=48, 48>=48 -> COPY
+               bias=0, dest=48//16-1=2, src=2 (==dest)
+               block_ids=[10,20,30,...] -> distinct IDs, same logical idx
+               -> self-copy (src_addr==dst_addr), set accepted=1
+        """
+        cfg = test_config
+        torch.manual_seed(5001)
+
+        req_ids = ["req_0", "req_1", "req_2", "req_3"]
+        num_computed_tokens = [30, 60, 30, 48]
+        num_scheduled_tokens = {"req_0": 2, "req_1": 5, "req_2": 3, "req_3": 0}
+        num_draft_tokens = {"req_1": 2}
+        num_accepted_tokens = [3, 3, 1, 1]
+        mamba_state_idx = [0, 2, 1, 2]
+
+        # Block IDs with various PC patterns:
+        # req_0: shared blocks (PC alias: logical 0 and 1 -> physical 5)
+        # req_1: distinct non-sequential blocks
+        # req_2: doesn't matter (no copy)
+        # req_3: distinct sequential blocks (no aliasing)
+        block_ids_per_req = [
+            [5, 5, 12, 18, 23, 31, 44, 2],  # req_0: blocks 0,1 share phys 5
+            [41, 7, 22, 15, 38, 19, 4, 28],  # req_1: all distinct
+            [10, 20, 30, 40, 1, 6, 8, 14],  # req_2: irrelevant
+            [10, 20, 30, 40, 1, 6, 8, 14],  # req_3: distinct, dest=src=idx 2
+        ]
+
+        layer_names = [f"layer_{i}" for i in range(cfg.num_layers)]
+        num_blocks = 50
+        local_cfg = _TestConfig(num_blocks=num_blocks, max_num_reqs=cfg.max_num_reqs)
+        kv_cache_config = _make_kv_cache_config(local_cfg, layer_names)
+        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
+
+        conv_states_py = [
+            torch.randn(
+                num_blocks,
+                cfg.conv_width,
+                cfg.conv_inner_dim,
+                dtype=cfg.dtype,
+                device=device,
+            )
+            for _ in range(cfg.num_layers)
+        ]
+        temporal_states_py = [
+            torch.randn(
+                num_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
+            )
+            for _ in range(cfg.num_layers)
+        ]
+
+        conv_states_gpu = [s.clone() for s in conv_states_py]
+        temporal_states_gpu = [s.clone() for s in temporal_states_py]
+
+        forward_context_py = {
+            name: _make_mock_attention(conv_states_py[i], temporal_states_py[i])
+            for i, name in enumerate(layer_names)
+        }
+        forward_context_gpu = {
+            name: _make_mock_attention(conv_states_gpu[i], temporal_states_gpu[i])
+            for i, name in enumerate(layer_names)
+        }
+
+        # --- Run Python path ---
+        scheduler_output = _make_postprocess_scheduler_output(
+            req_ids,
+            num_scheduled_tokens,
+            {k: [None] * v for k, v in num_draft_tokens.items() if v > 0},
+        )
+        input_batch_py = _make_input_batch(
+            req_ids, num_accepted_tokens.copy(), mamba_state_idx.copy()
+        )
+        requests = _make_requests(req_ids, num_computed_tokens, block_ids_per_req)
+        copy_bufs = _make_copy_bufs(local_cfg, kv_cache_config, device)
+
+        postprocess_mamba(
+            scheduler_output,
+            kv_cache_config,
+            input_batch_py,
+            requests,
+            forward_context_py,
+            copy_funcs,
+            copy_bufs,
+        )
+        torch.accelerator.synchronize()
+
+        # --- Run GPU path ---
+        gpu_ctx = MambaGPUContext.create(
+            max_num_reqs=local_cfg.max_num_reqs,
+            kv_cache_config=kv_cache_config,
+            num_state_types=2,
+            device=device,
+        )
+        gpu_ctx.initialize_from_forward_context(
+            kv_cache_config, forward_context_gpu, copy_funcs
+        )
+
+        num_reqs = len(req_ids)
+        max_blocks = max(len(b) for b in block_ids_per_req)
+        block_table_gpu = torch.zeros(
+            num_reqs, max_blocks, dtype=torch.int32, device=device
+        )
+        for i, block_ids in enumerate(block_ids_per_req):
+            block_table_gpu[i, : len(block_ids)] = torch.tensor(
+                block_ids, dtype=torch.int32
+            )
+
+        gpu_ctx.run_fused_postprocess(
+            num_reqs=num_reqs,
+            num_accepted_tokens_gpu=torch.tensor(
+                num_accepted_tokens, dtype=torch.int32, device=device
+            ),
+            mamba_state_idx_gpu=torch.tensor(
+                mamba_state_idx, dtype=torch.int32, device=device
+            ),
+            num_scheduled_tokens_gpu=torch.tensor(
+                [num_scheduled_tokens[r] for r in req_ids],
+                dtype=torch.int32,
+                device=device,
+            ),
+            num_computed_tokens_gpu=torch.tensor(
+                num_computed_tokens, dtype=torch.int32, device=device
+            ),
+            num_draft_tokens_gpu=torch.tensor(
+                [num_draft_tokens.get(r, 0) for r in req_ids],
+                dtype=torch.int32,
+                device=device,
+            ),
+            block_table_gpu=block_table_gpu,
+        )
+        torch.accelerator.synchronize()
+
+        # --- Compare all state tensors ---
+        for i in range(cfg.num_layers):
+            torch.testing.assert_close(
+                conv_states_gpu[i],
+                conv_states_py[i],
+                msg=(
+                    f"Conv state mismatch at layer {i} — "
+                    f"mixed PC batch with shared/distinct blocks"
+                ),
+            )
+            torch.testing.assert_close(
+                temporal_states_gpu[i],
+                temporal_states_py[i],
+                msg=(
+                    f"Temporal state mismatch at layer {i} — "
+                    f"mixed PC batch with shared/distinct blocks"
+                ),
+            )
+
+        # --- Compare num_accepted_tokens ---
+        expected_accepted = torch.tensor(
+            input_batch_py.num_accepted_tokens_cpu[:num_reqs],
+            dtype=torch.int32,
+            device=device,
+        )
+        torch.testing.assert_close(
+            gpu_ctx.num_accepted_tokens_out[:num_reqs],
+            expected_accepted,
+            msg="num_accepted_tokens mismatch in mixed PC batch",
+        )
+
+        # Verify per-request expectations:
+        # req_0: src!=dest, shared block -> preserved (3)
+        assert input_batch_py.num_accepted_tokens_cpu[0] == 3
+        # req_1: src!=dest, distinct blocks -> preserved (3)
+        assert input_batch_py.num_accepted_tokens_cpu[1] == 3
+        # req_2: no copy -> preserved (1)
+        assert input_batch_py.num_accepted_tokens_cpu[2] == 1
+        # req_3: src==dest -> set to 1
+        assert input_batch_py.num_accepted_tokens_cpu[3] == 1
