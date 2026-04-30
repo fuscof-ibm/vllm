@@ -2090,3 +2090,180 @@ class TestPostprocessMambaFusedKernel:
             temporal_state_py,
             msg="GPU temporal state should match Python",
         )
+
+    def test_as_strided_temporal_copy_size(self, device, test_config):
+        """
+        Regression test for 240723d46: temporal copy_size must be
+        inner_size * elem_size, not state_block_stride.
+
+        In production (gpu_model_runner.py), conv and temporal states share
+        a raw buffer via torch.as_strided where stride(0) equals
+        page_size_bytes / elem_size — larger than either state's natural
+        element count.  Using stride(0) as copy_size for temporal states
+        overwrites into the next block's conv region.
+
+        Layout per page (384 float16 elements = 768 bytes):
+            [conv: 256 elems | temporal: 128 elems]
+
+        The test triggers a temporal copy from block 4 to block 3.  With the
+        bug the kernel copies 768 bytes (page stride) instead of 256 bytes
+        (128 * 2), overwriting conv_state[4] with conv_state[5]'s data.
+
+        Test setup (block_size=16):
+        - running = 60 + 5 - 2 = 63
+        - new = 63 + 3 - 1 = 65
+        - aligned = 64 >= 63 -> COPY needed
+        - accept_token_bias = 64 - 63 = 1
+        - dest_block_idx = 64 // 16 - 1 = 3
+        - temporal: actual_src_block_idx = 3 + 1 = 4  (block_ids[4] = 4)
+        """
+        cfg = test_config
+        torch.manual_seed(7001)
+
+        req_ids = ["req_0"]
+        num_computed_tokens = [60]
+        num_scheduled_tokens = {"req_0": 5}
+        num_draft_tokens = {"req_0": 2}
+        num_accepted_tokens = [3]
+        mamba_state_idx = [3]
+        block_ids_per_req = [list(range(8))]
+
+        layer_names = ["layer_0"]
+        kv_cache_config = _make_kv_cache_config(cfg, layer_names)
+        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
+
+        # --- Production-like packed layout (mirrors gpu_model_runner.py) ---
+        conv_shape = (cfg.conv_width, cfg.conv_inner_dim)
+        temporal_shape = (cfg.temporal_state_dim,)
+        dtype = cfg.dtype
+        elem_size = torch.tensor([], dtype=dtype).element_size()
+
+        conv_natural_elems = cfg.conv_width * cfg.conv_inner_dim
+        temporal_natural_elems = cfg.temporal_state_dim
+        page_size_bytes = (conv_natural_elems + temporal_natural_elems) * elem_size
+        num_element_per_page = page_size_bytes // elem_size
+
+        assert num_element_per_page > temporal_natural_elems, (
+            "Test requires padded stride; page must be larger than one state"
+        )
+
+        raw_py = torch.randn(
+            cfg.num_blocks * num_element_per_page, dtype=dtype, device=device
+        )
+        raw_gpu = raw_py.clone()
+
+        def make_views(raw):
+            conv_tgt = (cfg.num_blocks, *conv_shape)
+            conv_nat_stride = torch.empty(conv_tgt).stride()
+            conv = torch.as_strided(
+                raw,
+                size=conv_tgt,
+                stride=(num_element_per_page, *conv_nat_stride[1:]),
+                storage_offset=0,
+            )
+
+            temp_tgt = (cfg.num_blocks, *temporal_shape)
+            temp_nat_stride = torch.empty(temp_tgt).stride()
+            temp = torch.as_strided(
+                raw,
+                size=temp_tgt,
+                stride=(num_element_per_page, *temp_nat_stride[1:]),
+                storage_offset=conv_natural_elems,
+            )
+            return conv, temp
+
+        conv_py, temp_py = make_views(raw_py)
+        conv_gpu, temp_gpu = make_views(raw_gpu)
+
+        fwd_py = {"layer_0": _make_mock_attention(conv_py, temp_py)}
+        fwd_gpu = {"layer_0": _make_mock_attention(conv_gpu, temp_gpu)}
+
+        # --- Python reference ---
+        sched = _make_postprocess_scheduler_output(
+            req_ids,
+            num_scheduled_tokens,
+            {k: [None] * v for k, v in num_draft_tokens.items() if v > 0},
+        )
+        batch_py = _make_input_batch(
+            req_ids, num_accepted_tokens.copy(), mamba_state_idx.copy()
+        )
+        requests = _make_requests(req_ids, num_computed_tokens, block_ids_per_req)
+        copy_bufs = _make_copy_bufs(cfg, kv_cache_config, device)
+
+        postprocess_mamba(
+            sched,
+            kv_cache_config,
+            batch_py,
+            requests,
+            fwd_py,
+            copy_funcs,
+            copy_bufs,
+        )
+        torch.accelerator.synchronize()
+
+        # --- GPU fused kernel ---
+        gpu_ctx = MambaGPUContext.create(
+            max_num_reqs=cfg.max_num_reqs,
+            kv_cache_config=kv_cache_config,
+            num_state_types=2,
+            device=device,
+        )
+        gpu_ctx.initialize_from_forward_context(kv_cache_config, fwd_gpu, copy_funcs)
+
+        num_reqs = 1
+        block_table = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
+        block_table[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
+
+        gpu_ctx.run_fused_postprocess(
+            num_reqs=num_reqs,
+            num_accepted_tokens_gpu=torch.tensor(
+                num_accepted_tokens, dtype=torch.int32, device=device
+            ),
+            mamba_state_idx_gpu=torch.tensor(
+                mamba_state_idx, dtype=torch.int32, device=device
+            ),
+            num_scheduled_tokens_gpu=torch.tensor(
+                [num_scheduled_tokens[r] for r in req_ids],
+                dtype=torch.int32,
+                device=device,
+            ),
+            num_computed_tokens_gpu=torch.tensor(
+                num_computed_tokens, dtype=torch.int32, device=device
+            ),
+            num_draft_tokens_gpu=torch.tensor(
+                [num_draft_tokens.get(r, 0) for r in req_ids],
+                dtype=torch.int32,
+                device=device,
+            ),
+            block_table_gpu=block_table,
+        )
+        torch.accelerator.synchronize()
+
+        # --- Assertions ---
+        # With the bug (pre-240723d46), the kernel copies page_size_bytes
+        # (768) for temporal state instead of 256 bytes, overwriting
+        # conv_state[4] with conv_state[5]'s data.
+        torch.testing.assert_close(
+            conv_gpu,
+            conv_py,
+            msg=(
+                "Conv state corrupted: temporal copy_size was likely "
+                "state_block_stride instead of inner_size * elem_size"
+            ),
+        )
+        torch.testing.assert_close(
+            temp_gpu,
+            temp_py,
+            msg="Temporal state mismatch",
+        )
+
+        expected_accepted = torch.tensor(
+            batch_py.num_accepted_tokens_cpu[:num_reqs],
+            dtype=torch.int32,
+            device=device,
+        )
+        torch.testing.assert_close(
+            gpu_ctx.num_accepted_tokens_out[:num_reqs],
+            expected_accepted,
+            msg="num_accepted_tokens mismatch",
+        )
