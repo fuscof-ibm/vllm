@@ -2267,3 +2267,167 @@ class TestPostprocessMambaFusedKernel:
             expected_accepted,
             msg="num_accepted_tokens mismatch",
         )
+
+    def test_temporal_copy_with_bias_ge_2(self, device, test_config):
+        """
+        Coverage test for the temporal-state block-table stride arithmetic
+        when ``accept_token_bias >= 2``.
+
+        The kernel computes, for temporal (non-conv) states::
+
+            actual_src_block_idx = src_block_idx + accept_token_bias
+            actual_src_block_id = block_table[req, actual_src_block_idx]
+
+        All prior regression tests exercise only ``bias == 1``, i.e. they
+        only ever read one slot ahead of ``src_block_idx`` in the block
+        table. An off-by-one (or missing scale) in the address computation
+        on line 143 of ``mamba_utils.py`` would be invisible to every
+        existing test but would silently read the wrong physical block on
+        any speculative-decode cycle that accepts multiple tokens across a
+        block boundary, feeding a stale hidden state forward one step.
+
+        Setup (block_size=16):
+        - running   = 28 + 2 - 0 = 30
+        - new       = 30 + 3 - 1 = 32
+        - aligned   = 32 >= 30 -> COPY needed
+        - bias      = 32 - 30 = 2             (key: >= 2)
+        - dest_idx  = 32 // 16 - 1 = 1
+        - src_idx   = 1 (same as dest -> exercises post-copy accepted=1 write)
+        - temporal actual_src_block_idx = 1 + 2 = 3 (reads block_table[0, 3])
+
+        With identity block_ids = [0,1,2,3,...], an off-by-one that used
+        bias=1 would copy from block_ids[2]=2 instead of block_ids[3]=3,
+        producing a clear state-value mismatch against the Python
+        reference.
+        """
+        cfg = test_config
+        torch.manual_seed(7002)
+
+        req_ids = ["req_0"]
+        num_computed_tokens = [28]
+        num_scheduled_tokens = {"req_0": 2}
+        num_draft_tokens: dict[str, int] = {}
+        num_accepted_tokens = [3]  # -> accept_token_bias = 2
+        mamba_state_idx = [1]  # src_block_idx = 1 = dest_block_idx
+        block_ids_per_req = [list(range(8))]
+
+        layer_names = ["layer_0"]
+        kv_cache_config = _make_kv_cache_config(cfg, layer_names)
+        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
+
+        conv_state_py = torch.randn(
+            cfg.num_blocks,
+            cfg.conv_width,
+            cfg.conv_inner_dim,
+            dtype=cfg.dtype,
+            device=device,
+        )
+        temporal_state_py = torch.randn(
+            cfg.num_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
+        )
+        conv_state_gpu = conv_state_py.clone()
+        temporal_state_gpu = temporal_state_py.clone()
+        temporal_state_orig = temporal_state_py.clone()
+
+        fwd_py = {"layer_0": _make_mock_attention(conv_state_py, temporal_state_py)}
+        fwd_gpu = {"layer_0": _make_mock_attention(conv_state_gpu, temporal_state_gpu)}
+
+        # --- Python reference ---
+        sched = _make_postprocess_scheduler_output(
+            req_ids,
+            num_scheduled_tokens,
+            {k: [None] * v for k, v in num_draft_tokens.items() if v > 0},
+        )
+        batch_py = _make_input_batch(
+            req_ids, num_accepted_tokens.copy(), mamba_state_idx.copy()
+        )
+        requests = _make_requests(req_ids, num_computed_tokens, block_ids_per_req)
+        copy_bufs = _make_copy_bufs(cfg, kv_cache_config, device)
+
+        postprocess_mamba(
+            sched,
+            kv_cache_config,
+            batch_py,
+            requests,
+            fwd_py,
+            copy_funcs,
+            copy_bufs,
+        )
+        torch.accelerator.synchronize()
+
+        # --- GPU fused kernel ---
+        gpu_ctx = MambaGPUContext.create(
+            max_num_reqs=cfg.max_num_reqs,
+            kv_cache_config=kv_cache_config,
+            num_state_types=2,
+            device=device,
+        )
+        gpu_ctx.initialize_from_forward_context(kv_cache_config, fwd_gpu, copy_funcs)
+
+        num_reqs = 1
+        block_table = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
+        block_table[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
+
+        gpu_ctx.run_fused_postprocess(
+            num_reqs=num_reqs,
+            num_accepted_tokens_gpu=torch.tensor(
+                num_accepted_tokens, dtype=torch.int32, device=device
+            ),
+            mamba_state_idx_gpu=torch.tensor(
+                mamba_state_idx, dtype=torch.int32, device=device
+            ),
+            num_scheduled_tokens_gpu=torch.tensor(
+                [num_scheduled_tokens[r] for r in req_ids],
+                dtype=torch.int32,
+                device=device,
+            ),
+            num_computed_tokens_gpu=torch.tensor(
+                num_computed_tokens, dtype=torch.int32, device=device
+            ),
+            num_draft_tokens_gpu=torch.tensor(
+                [num_draft_tokens.get(r, 0) for r in req_ids],
+                dtype=torch.int32,
+                device=device,
+            ),
+            block_table_gpu=block_table,
+        )
+        torch.accelerator.synchronize()
+
+        # --- Ground truth: Python must have sourced temporal from block 3 ---
+        actual_src_block_id = block_ids_per_req[0][3]  # == 3
+        dest_block_id = block_ids_per_req[0][1]  # == 1
+        torch.testing.assert_close(
+            temporal_state_py[dest_block_id],
+            temporal_state_orig[actual_src_block_id],
+            msg=(
+                "Python reference did not copy from block_ids[src+bias]=3; "
+                "test preconditions are wrong"
+            ),
+        )
+
+        # --- GPU kernel must match Python byte-for-byte ---
+        torch.testing.assert_close(
+            conv_state_gpu,
+            conv_state_py,
+            msg="Conv state mismatch at accept_token_bias=2",
+        )
+        torch.testing.assert_close(
+            temporal_state_gpu,
+            temporal_state_py,
+            msg=(
+                "Temporal state mismatch at accept_token_bias=2: the kernel "
+                "likely read the wrong slot of the block table "
+                "(actual_src_block_idx stride arithmetic)"
+            ),
+        )
+
+        expected_accepted = torch.tensor(
+            batch_py.num_accepted_tokens_cpu[:num_reqs],
+            dtype=torch.int32,
+            device=device,
+        )
+        torch.testing.assert_close(
+            gpu_ctx.num_accepted_tokens_out[:num_reqs],
+            expected_accepted,
+            msg="num_accepted_tokens mismatch at accept_token_bias=2",
+        )
