@@ -6,6 +6,7 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
@@ -41,6 +42,12 @@ def postprocess_mamba_fused_kernel(
     state_conv_widths_ptr,  # conv width for conv states (0 for temporal)
     # Output: num_accepted_tokens update (for src==dst case)
     num_accepted_tokens_out_ptr,
+    # Debug output: [max_reqs, total_states, 8] int64 (only written when DEBUG)
+    # Fields: needs_copy, accept_token_bias, dest_block_idx, src_phys_block,
+    #         dest_phys_block, src_addr, dst_addr, copy_size
+    debug_output_ptr,
+    debug_stride_req: tl.int64,
+    debug_stride_state: tl.int64,
     # Runtime parameter (varies per batch - NOT constexpr to avoid recompilation)
     num_reqs,
     # Compile-time constants (fixed after model initialization)
@@ -48,6 +55,8 @@ def postprocess_mamba_fused_kernel(
     block_size: tl.constexpr,
     # COPY_BLOCK_SIZE: fixed tuning parameter for memory copy loop
     COPY_BLOCK_SIZE: tl.constexpr,
+    # DEBUG: when True, write intermediate values to debug_output
+    DEBUG: tl.constexpr,
 ):
     """
     Fused GPU kernel for postprocess_mamba that computes decisions AND performs
@@ -82,6 +91,13 @@ def postprocess_mamba_fused_kernel(
     needs_copy = aligned_new_computed >= num_tokens_running_state
 
     if not needs_copy:
+        if DEBUG:
+            db = (
+                debug_output_ptr
+                + req_idx * debug_stride_req
+                + state_idx * debug_stride_state
+            )
+            tl.store(db + 0, tl.cast(0, tl.int64))
         return
 
     # Compute copy parameters
@@ -118,6 +134,7 @@ def postprocess_mamba_fused_kernel(
         # (conv_width - accept_token_bias) * inner_size
         num_elems_to_copy = (conv_width - accept_token_bias) * state_inner_size
         copy_size = num_elems_to_copy * state_elem_size
+        debug_src_phys = src_block_id
     else:
         # Temporal state: copy from state[src_block_id + accept_token_bias]
         # to state[dest_block_id]
@@ -126,6 +143,22 @@ def postprocess_mamba_fused_kernel(
         src_addr = state_base_addr + actual_src_block_id * state_block_stride
         dst_addr = state_base_addr + dest_block_id * state_block_stride
         copy_size = state_block_stride
+        debug_src_phys = actual_src_block_id
+
+    if DEBUG:
+        db = (
+            debug_output_ptr
+            + req_idx * debug_stride_req
+            + state_idx * debug_stride_state
+        )
+        tl.store(db + 0, tl.cast(1, tl.int64))
+        tl.store(db + 1, tl.cast(accept_token_bias, tl.int64))
+        tl.store(db + 2, tl.cast(dest_block_idx, tl.int64))
+        tl.store(db + 3, tl.cast(debug_src_phys, tl.int64))
+        tl.store(db + 4, tl.cast(dest_block_id, tl.int64))
+        tl.store(db + 5, src_addr)
+        tl.store(db + 6, dst_addr)
+        tl.store(db + 7, copy_size)
 
     # Match Python reference (collect_mamba_copy_meta): skip copy only when
     # src and dest are the same logical block with no token bias.
@@ -254,6 +287,11 @@ class MambaGPUContext:
     # Output buffer for num_accepted_tokens updates
     num_accepted_tokens_out: torch.Tensor
 
+    # Debug output tensor: [max_reqs, total_states, 8] int64
+    # Fields: needs_copy, accept_token_bias, dest_block_idx, src_phys_block,
+    #         dest_phys_block, src_addr, dst_addr, copy_size
+    debug_output: torch.Tensor | None = None
+
     # Flag to track if metadata has been populated
     is_initialized: bool = False
 
@@ -297,6 +335,17 @@ class MambaGPUContext:
             mamba_group_ids=mamba_group_ids,
             num_accepted_tokens_out=torch.zeros(
                 max_num_reqs, dtype=torch.int32, device=device
+            ),
+            debug_output=(
+                torch.zeros(
+                    max_num_reqs,
+                    total_states,
+                    8,
+                    dtype=torch.int64,
+                    device=device,
+                )
+                if envs.VLLM_DEBUG_MAMBA_POSTPROCESS
+                else None
             ),
             is_initialized=False,
         )
@@ -436,6 +485,17 @@ class MambaGPUContext:
         total_states = self.num_layers * self.num_state_types
         grid = (num_reqs, total_states)
 
+        is_debug = self.debug_output is not None
+        if is_debug:
+            assert self.debug_output is not None
+            debug_ptr = self.debug_output
+            debug_stride_req = self.debug_output.stride(0)
+            debug_stride_state = self.debug_output.stride(1)
+        else:
+            debug_ptr = self.num_accepted_tokens_out  # unused dummy
+            debug_stride_req = 0
+            debug_stride_state = 0
+
         postprocess_mamba_fused_kernel[grid](
             num_accepted_tokens_gpu,
             mamba_state_idx_gpu,
@@ -450,9 +510,13 @@ class MambaGPUContext:
             self.state_inner_sizes,
             self.state_conv_widths,
             self.num_accepted_tokens_out,
+            debug_ptr,
+            debug_stride_req,
+            debug_stride_state,
             num_reqs,
             block_size=self.block_size,
             COPY_BLOCK_SIZE=1024,
+            DEBUG=is_debug,
         )
 
 

@@ -1570,10 +1570,22 @@ class GPUModelRunner(
         torch.accelerator.synchronize()
         kernel_num_accepted = ctx.num_accepted_tokens_out[:num_reqs].cpu().clone()
 
+        kernel_debug = None
+        if ctx.debug_output is not None:
+            kernel_debug = ctx.debug_output[:num_reqs].cpu().clone()
+
         kernel_states: dict[str, list[torch.Tensor]] = {}
         for layer_name, attn in fwd_ctx.items():
             if hasattr(attn, "kv_cache"):
                 kernel_states[layer_name] = [s.cpu().clone() for s in attn.kv_cache]
+
+        # Read GPU block table for comparison with CPU block_ids.
+        mamba_group_id = ctx.mamba_group_ids[0]
+        gpu_bt = (
+            self.input_batch.block_table[mamba_group_id]
+            .get_device_tensor(num_reqs)
+            .cpu()
+        )
 
         # Restore pre-kernel mamba states.
         for layer_name, orig_states in pre_kernel_states.items():
@@ -1617,6 +1629,7 @@ class GPUModelRunner(
                     self.num_draft_tokens_buf.np[i],
                 )
 
+        has_mismatch = False
         for layer_name in kernel_states:
             attn = fwd_ctx[layer_name]
             for state_idx, (kern_s, ref_s_gpu) in enumerate(
@@ -1624,10 +1637,12 @@ class GPUModelRunner(
             ):
                 ref_s = ref_s_gpu.cpu()
                 if not torch.equal(kern_s, ref_s):
+                    has_mismatch = True
                     diff_blocks = (
                         (kern_s != ref_s)
                         .any(dim=tuple(range(1, kern_s.dim())))
                         .nonzero()
+                        .flatten()
                     )
                     logger.warning(
                         "MAMBA STATE MISMATCH layer=%s state=%d diff_blocks=%s",
@@ -1635,6 +1650,15 @@ class GPUModelRunner(
                         state_idx,
                         diff_blocks.tolist(),
                     )
+
+        if has_mismatch:
+            self._log_mamba_debug_details(
+                ctx,
+                num_reqs,
+                kernel_debug,
+                gpu_bt,
+                mamba_group_id,
+            )
 
         # Restore kernel results so production path continues.
         for layer_name, kern_state_list in kernel_states.items():
@@ -1644,6 +1668,90 @@ class GPUModelRunner(
         ctx.num_accepted_tokens_out[:num_reqs].copy_(
             kernel_num_accepted.to(self.device)
         )
+
+    def _log_mamba_debug_details(
+        self,
+        ctx: "mamba_utils.MambaGPUContext",
+        num_reqs: int,
+        kernel_debug: torch.Tensor | None,
+        gpu_bt: torch.Tensor,
+        mamba_group_id: int,
+    ) -> None:
+        """Log per-request kernel debug values vs CPU block IDs."""
+        block_size = ctx.block_size
+        for i in range(num_reqs):
+            req_id = self.input_batch.req_ids[i]
+            req_state = self.requests[req_id]
+            cpu_bids = req_state.block_ids[mamba_group_id]
+
+            num_accepted_raw = self.num_accepted_tokens.gpu[i].item()
+            sbi = int(self.mamba_state_idx.np[i])
+            ns = int(self.num_scheduled_tokens_buf.np[i])
+            nc = int(self.num_computed_tokens_buf.np[i])
+            nd = int(self.num_draft_tokens_buf.np[i])
+
+            run_st = nc + ns - nd
+            new_nc = run_st + num_accepted_raw - 1
+            aligned = (new_nc // block_size) * block_size
+            needs_copy = aligned >= run_st
+
+            if not needs_copy:
+                continue
+
+            atb = aligned - run_st
+            dbi = aligned // block_size - 1
+
+            gpu_src = int(gpu_bt[i, sbi])
+            gpu_dst = int(gpu_bt[i, dbi])
+            cpu_src = cpu_bids[sbi] if sbi < len(cpu_bids) else -1
+            cpu_dst = cpu_bids[dbi] if dbi < len(cpu_bids) else -1
+
+            # Temporal state uses block_table[sbi + atb]
+            temp_idx = sbi + atb
+            gpu_temp_src = int(gpu_bt[i, temp_idx]) if atb > 0 else gpu_src
+            cpu_temp_src = (
+                (cpu_bids[temp_idx] if temp_idx < len(cpu_bids) else -1)
+                if atb > 0
+                else cpu_src
+            )
+
+            kd_str = ""
+            if kernel_debug is not None:
+                kd = kernel_debug[i, 0]
+                kd_str = (
+                    f"kernel_s0[nc={kd[0]},atb={kd[1]},dbi={kd[2]},"
+                    f"src_ph={kd[3]},dst_ph={kd[4]},"
+                    f"sa=0x{kd[5]:x},da=0x{kd[6]:x},sz={kd[7]}] "
+                )
+
+            logger.warning(
+                "MAMBA DEBUG req=%d id=%s: "
+                "raw_accepted=%d sbi=%d nc=%d ns=%d nd=%d "
+                "atb=%d dbi=%d "
+                "%s"
+                "gpu_bt[src=%d,dst=%d,temp_src=%d] "
+                "cpu_bids[src=%d,dst=%d,temp_src=%d] "
+                "match=[src=%s,dst=%s,temp=%s]",
+                i,
+                req_id[:8],
+                num_accepted_raw,
+                sbi,
+                nc,
+                ns,
+                nd,
+                atb,
+                dbi,
+                kd_str,
+                gpu_src,
+                gpu_dst,
+                gpu_temp_src,
+                cpu_src,
+                cpu_dst,
+                cpu_temp_src,
+                gpu_src == cpu_src,
+                gpu_dst == cpu_dst,
+                gpu_temp_src == cpu_temp_src,
+            )
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
