@@ -142,7 +142,10 @@ def postprocess_mamba_fused_kernel(
         actual_src_block_id = tl.load(block_table_base + actual_src_block_idx)
         src_addr = state_base_addr + actual_src_block_id * state_block_stride
         dst_addr = state_base_addr + dest_block_id * state_block_stride
-        copy_size = state_block_stride
+        # Use natural block data size (inner_size * elem_size), NOT
+        # state_block_stride which is the page stride and can exceed the
+        # actual data when the state tensor uses as_strided page padding.
+        copy_size = state_inner_size * state_elem_size
         debug_src_phys = actual_src_block_id
 
     if DEBUG:
@@ -441,9 +444,16 @@ class MambaGPUContext:
                             # 2D tensor: [num_blocks, conv_dim], no inner dims
                             self.state_inner_sizes[idx] = 1
                     else:
-                        # Temporal state: inner_size not used by kernel
+                        # Temporal state: inner_size = natural elements per
+                        # block (prod of inner dims).  The kernel uses this
+                        # to compute copy_size = inner_size * elem_size,
+                        # which gives the correct byte count even when the
+                        # state tensor is as_strided with padded page strides
+                        # (state_block_stride would be the page size, too big).
                         self.state_conv_widths[idx] = 0
-                        self.state_inner_sizes[idx] = 1
+                        self.state_inner_sizes[idx] = (
+                            state[0].numel() if state.dim() > 1 else 1
+                        )
 
                     idx += 1
 
