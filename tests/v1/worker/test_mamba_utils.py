@@ -2120,3 +2120,169 @@ class TestPostprocessMambaFusedKernel:
         assert input_batch_py.num_accepted_tokens_cpu[2] == 1
         # req_3: src==dest -> set to 1
         assert input_batch_py.num_accepted_tokens_cpu[3] == 1
+
+    def test_pc_aliased_blocks_skip_must_use_logical_idx_not_addr(
+        self, device, test_config
+    ):
+        """
+        Regression test for 6466ce0d vs 959ca0fd: the kernel's early-return
+        guard must compare logical block indices, not physical addresses.
+
+        Under prefix caching, different logical blocks (src_block_idx=0,
+        dest_block_idx=1) can map to the same physical block. When
+        accept_token_bias=0, this makes src_addr == dst_addr for BOTH conv
+        and temporal states. A buggy guard `if src_addr == dst_addr` would
+        incorrectly set num_accepted_tokens=1; the correct guard is
+        `if src_block_idx == dest_block_idx and accept_token_bias == 0`.
+
+        The Python reference only sets num_accepted_tokens=1 when
+        src_block_idx == dest_block_idx (line 79 of postprocess_mamba).
+        With src_block_idx=0, dest_block_idx=1, num_accepted_tokens must
+        be preserved even though the physical addresses match.
+
+        Test setup (block_size=16):
+        - num_tokens_running_state = 30 + 2 - 0 = 32
+        - new_num_computed = 32 + 3 - 1 = 34
+        - aligned_new_computed = 32
+        - needs_copy = (32 >= 32) = True
+        - accept_token_bias = 32 - 32 = 0
+        - dest_block_idx = 32 // 16 - 1 = 1
+        - src_block_idx = 0 (explicitly, != dest_block_idx)
+        - block_ids = [7, 7, ...] -> physical aliasing via prefix caching
+
+        Expected: num_accepted_tokens stays 3 (not set to 1).
+        Bug (959ca0fd): kernel saw src_addr == dst_addr, set it to 1.
+        """
+        cfg = test_config
+        torch.manual_seed(6001)
+
+        req_ids = ["req_0"]
+        num_computed_tokens = [30]
+        num_scheduled_tokens = {"req_0": 2}
+        num_draft_tokens: dict[str, int] = {}
+        num_accepted_tokens = [3]
+        mamba_state_idx = [0]  # src_block_idx = 0
+
+        # Prefix caching: logical blocks 0 and 1 both map to physical block 7.
+        block_ids_per_req = [[7, 7, 10, 11, 12, 13, 14, 15]]
+
+        layer_names = ["layer_0"]
+        kv_cache_config = _make_kv_cache_config(cfg, layer_names)
+        copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
+
+        conv_state_py = torch.randn(
+            cfg.num_blocks,
+            cfg.conv_width,
+            cfg.conv_inner_dim,
+            dtype=cfg.dtype,
+            device=device,
+        )
+        temporal_state_py = torch.randn(
+            cfg.num_blocks, cfg.temporal_state_dim, dtype=cfg.dtype, device=device
+        )
+        conv_state_gpu = conv_state_py.clone()
+        temporal_state_gpu = temporal_state_py.clone()
+
+        forward_context_py = {
+            "layer_0": _make_mock_attention(conv_state_py, temporal_state_py)
+        }
+        forward_context_gpu = {
+            "layer_0": _make_mock_attention(conv_state_gpu, temporal_state_gpu)
+        }
+
+        # --- Run Python path ---
+        scheduler_output = _make_postprocess_scheduler_output(
+            req_ids,
+            num_scheduled_tokens,
+            {k: [None] * v for k, v in num_draft_tokens.items() if v > 0},
+        )
+        input_batch_py = _make_input_batch(
+            req_ids, num_accepted_tokens.copy(), mamba_state_idx.copy()
+        )
+        requests = _make_requests(req_ids, num_computed_tokens, block_ids_per_req)
+        copy_bufs = _make_copy_bufs(cfg, kv_cache_config, device)
+
+        postprocess_mamba(
+            scheduler_output,
+            kv_cache_config,
+            input_batch_py,
+            requests,
+            forward_context_py,
+            copy_funcs,
+            copy_bufs,
+        )
+        torch.accelerator.synchronize()
+
+        # Python reference: src_block_idx(0) != dest_block_idx(1) -> no change
+        assert input_batch_py.num_accepted_tokens_cpu[0] == 3, (
+            f"Python: num_accepted_tokens should remain 3, "
+            f"got {input_batch_py.num_accepted_tokens_cpu[0]}"
+        )
+
+        # --- Run GPU path ---
+        gpu_ctx = MambaGPUContext.create(
+            max_num_reqs=cfg.max_num_reqs,
+            kv_cache_config=kv_cache_config,
+            num_state_types=2,
+            device=device,
+        )
+        gpu_ctx.initialize_from_forward_context(
+            kv_cache_config, forward_context_gpu, copy_funcs
+        )
+
+        num_reqs = len(req_ids)
+        block_table_gpu = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
+        block_table_gpu[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
+
+        gpu_ctx.run_fused_postprocess(
+            num_reqs=num_reqs,
+            num_accepted_tokens_gpu=torch.tensor(
+                num_accepted_tokens, dtype=torch.int32, device=device
+            ),
+            mamba_state_idx_gpu=torch.tensor(
+                mamba_state_idx, dtype=torch.int32, device=device
+            ),
+            num_scheduled_tokens_gpu=torch.tensor(
+                [num_scheduled_tokens[r] for r in req_ids],
+                dtype=torch.int32,
+                device=device,
+            ),
+            num_computed_tokens_gpu=torch.tensor(
+                num_computed_tokens, dtype=torch.int32, device=device
+            ),
+            num_draft_tokens_gpu=torch.tensor(
+                [num_draft_tokens.get(r, 0) for r in req_ids],
+                dtype=torch.int32,
+                device=device,
+            ),
+            block_table_gpu=block_table_gpu,
+        )
+        torch.accelerator.synchronize()
+
+        # The critical assertion: kernel must NOT set num_accepted_tokens to 1
+        # when src_block_idx != dest_block_idx, even though src_addr == dst_addr
+        # due to prefix caching aliasing.
+        #
+        # Old kernel (959ca0fd): `if src_addr == dst_addr` -> FAILS here (sets 1)
+        # Fixed kernel (6466ce0d): `if src_block_idx == dest_block_idx and
+        #   accept_token_bias == 0` -> PASSES (preserves 3)
+        kernel_accepted = gpu_ctx.num_accepted_tokens_out[0].item()
+        assert kernel_accepted == 3, (
+            f"Kernel set num_accepted_tokens to {kernel_accepted} but expected 3. "
+            f"The early-return guard likely compared physical addresses "
+            f"(src_addr == dst_addr) instead of logical block indices "
+            f"(src_block_idx == dest_block_idx). Under prefix caching, "
+            f"different logical blocks can share the same physical block."
+        )
+
+        # Also verify state tensors match Python
+        torch.testing.assert_close(
+            conv_state_gpu,
+            conv_state_py,
+            msg="GPU conv state should match Python",
+        )
+        torch.testing.assert_close(
+            temporal_state_gpu,
+            temporal_state_py,
+            msg="GPU temporal state should match Python",
+        )
