@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
+import itertools
 from collections.abc import Callable
 from typing import Any
 
@@ -661,11 +662,16 @@ def preprocess_mamba(
     block_size = mamba_spec.block_size
 
     # Clear mamba_state_idx for finished/preempted/resumed requests.
-    # Note: This is now handled in input_batch.remove_request() which sets
-    # mamba_state_idx_cpu[req_index] = -1. For resumed requests that weren't
-    # removed, we reset them here.
+    # Mirrors the pre-refactor dict-based path: sweep all three sets as a
+    # safety net. remove_request() already resets finished/preempted slots,
+    # but force-preemption paths (e.g. reset_prefix_cache / KV cache flush)
+    # can surface a request in resumed_req_ids without a matching
+    # preempted_req_ids entry, leaving a stale curr_state_idx that would
+    # point past the new (smaller) block allocation.
+    finished_req_ids = scheduler_output.finished_req_ids
+    preempted_req_ids = scheduler_output.preempted_req_ids or set()
     resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
-    for req_id in resumed_req_ids:
+    for req_id in itertools.chain(finished_req_ids, preempted_req_ids, resumed_req_ids):
         req_index = input_batch.req_id_to_index.get(req_id)
         if req_index is not None:
             input_batch.mamba_state_idx_cpu[req_index] = -1
