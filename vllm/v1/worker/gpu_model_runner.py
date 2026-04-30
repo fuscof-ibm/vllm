@@ -1639,26 +1639,30 @@ class GPUModelRunner(
         )
 
         # Diagnostic: check if kernel modified state at all (should be no-op
-        # when src==dest and atb==0).
+        # when src==dest and atb==0).  Use NaN-aware comparison so that
+        # uninitialized blocks containing NaN don't trigger false alarms
+        # (IEEE 754: NaN != NaN).
         for layer_name in kernel_states:
             if layer_name in pre_kernel_states:
                 for si, (ks, pks) in enumerate(
                     zip(kernel_states[layer_name], pre_kernel_states[layer_name])
                 ):
                     if not torch.equal(ks, pks):
+                        both_nan = torch.isnan(ks) & torch.isnan(pks)
+                        real_diff = (ks != pks) & ~both_nan
                         d = (
-                            (ks != pks)
-                            .any(dim=tuple(range(1, ks.dim())))
+                            real_diff.any(dim=tuple(range(1, ks.dim())))
                             .nonzero()
                             .flatten()
                         )
-                        logger.warning(
-                            "KERNEL MODIFIED STATE layer=%s state=%d "
-                            "diff_blocks=%s (kernel is NOT a no-op!)",
-                            layer_name,
-                            si,
-                            d.tolist(),
-                        )
+                        if d.numel() > 0:
+                            logger.warning(
+                                "KERNEL MODIFIED STATE layer=%s state=%d "
+                                "diff_blocks=%s (kernel is NOT a no-op!)",
+                                layer_name,
+                                si,
+                                d.tolist(),
+                            )
 
         for layer_name in kernel_states:
             attn = fwd_ctx[layer_name]
