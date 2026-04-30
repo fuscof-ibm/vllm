@@ -1500,8 +1500,10 @@ class GPUModelRunner(
             ].get_device_tensor(num_reqs)
 
             # Snapshot mamba states before kernel (for debug validation).
+            # Sync first to ensure all forward pass writes have landed.
             pre_kernel_states: dict[str, list[torch.Tensor]] = {}
             if envs.VLLM_DEBUG_MAMBA_POSTPROCESS:
+                torch.accelerator.synchronize()
                 fwd_ctx = self.compilation_config.static_forward_context
                 for layer_name, attn in fwd_ctx.items():
                     if hasattr(attn, "kv_cache"):
@@ -1630,6 +1632,11 @@ class GPUModelRunner(
                 )
 
         has_mismatch = False
+        logger.warning(
+            "MAMBA VALIDATE num_reqs=%d block_size=%d",
+            num_reqs,
+            ctx.block_size,
+        )
         for layer_name in kernel_states:
             attn = fwd_ctx[layer_name]
             for state_idx, (kern_s, ref_s_gpu) in enumerate(
@@ -1693,65 +1700,82 @@ class GPUModelRunner(
             run_st = nc + ns - nd
             new_nc = run_st + num_accepted_raw - 1
             aligned = (new_nc // block_size) * block_size
-            needs_copy = aligned >= run_st
+            cpu_needs_copy = aligned >= run_st
 
-            if not needs_copy:
-                continue
-
-            atb = aligned - run_st
-            dbi = aligned // block_size - 1
-
-            gpu_src = int(gpu_bt[i, sbi])
-            gpu_dst = int(gpu_bt[i, dbi])
-            cpu_src = cpu_bids[sbi] if sbi < len(cpu_bids) else -1
-            cpu_dst = cpu_bids[dbi] if dbi < len(cpu_bids) else -1
-
-            # Temporal state uses block_table[sbi + atb]
-            temp_idx = sbi + atb
-            gpu_temp_src = int(gpu_bt[i, temp_idx]) if atb > 0 else gpu_src
-            cpu_temp_src = (
-                (cpu_bids[temp_idx] if temp_idx < len(cpu_bids) else -1)
-                if atb > 0
-                else cpu_src
-            )
-
+            # Always show kernel's needs_copy for this request
+            kernel_needs_copy = -1
             kd_str = ""
             if kernel_debug is not None:
                 kd = kernel_debug[i, 0]
+                kernel_needs_copy = int(kd[0])
                 kd_str = (
                     f"kernel_s0[nc={kd[0]},atb={kd[1]},dbi={kd[2]},"
                     f"src_ph={kd[3]},dst_ph={kd[4]},"
                     f"sa=0x{kd[5]:x},da=0x{kd[6]:x},sz={kd[7]}] "
                 )
 
-            logger.warning(
-                "MAMBA DEBUG req=%d id=%s: "
-                "raw_accepted=%d sbi=%d nc=%d ns=%d nd=%d "
-                "atb=%d dbi=%d "
-                "%s"
-                "gpu_bt[src=%d,dst=%d,temp_src=%d] "
-                "cpu_bids[src=%d,dst=%d,temp_src=%d] "
-                "match=[src=%s,dst=%s,temp=%s]",
-                i,
-                req_id[:8],
-                num_accepted_raw,
-                sbi,
-                nc,
-                ns,
-                nd,
-                atb,
-                dbi,
-                kd_str,
-                gpu_src,
-                gpu_dst,
-                gpu_temp_src,
-                cpu_src,
-                cpu_dst,
-                cpu_temp_src,
-                gpu_src == cpu_src,
-                gpu_dst == cpu_dst,
-                gpu_temp_src == cpu_temp_src,
-            )
+            if cpu_needs_copy:
+                atb = aligned - run_st
+                dbi = aligned // block_size - 1
+
+                gpu_src = int(gpu_bt[i, sbi])
+                gpu_dst = int(gpu_bt[i, dbi])
+                cpu_src = cpu_bids[sbi] if sbi < len(cpu_bids) else -1
+                cpu_dst = cpu_bids[dbi] if dbi < len(cpu_bids) else -1
+
+                temp_idx = sbi + atb
+                gpu_temp_src = int(gpu_bt[i, temp_idx]) if atb > 0 else gpu_src
+                cpu_temp_src = (
+                    (cpu_bids[temp_idx] if temp_idx < len(cpu_bids) else -1)
+                    if atb > 0
+                    else cpu_src
+                )
+
+                logger.warning(
+                    "MAMBA DEBUG req=%d id=%s: "
+                    "raw_accepted=%d sbi=%d nc=%d ns=%d nd=%d "
+                    "cpu_nc=%s kernel_nc=%d atb=%d dbi=%d "
+                    "%s"
+                    "gpu_bt[src=%d,dst=%d,temp_src=%d] "
+                    "cpu_bids[src=%d,dst=%d,temp_src=%d] "
+                    "match=[src=%s,dst=%s,temp=%s]",
+                    i,
+                    req_id[:8],
+                    num_accepted_raw,
+                    sbi,
+                    nc,
+                    ns,
+                    nd,
+                    cpu_needs_copy,
+                    kernel_needs_copy,
+                    atb,
+                    dbi,
+                    kd_str,
+                    gpu_src,
+                    gpu_dst,
+                    gpu_temp_src,
+                    cpu_src,
+                    cpu_dst,
+                    cpu_temp_src,
+                    gpu_src == cpu_src,
+                    gpu_dst == cpu_dst,
+                    gpu_temp_src == cpu_temp_src,
+                )
+            else:
+                logger.warning(
+                    "MAMBA DEBUG req=%d id=%s: "
+                    "raw_accepted=%d sbi=%d nc=%d ns=%d nd=%d "
+                    "cpu_nc=False kernel_nc=%d %s",
+                    i,
+                    req_id[:8],
+                    num_accepted_raw,
+                    sbi,
+                    nc,
+                    ns,
+                    nd,
+                    kernel_needs_copy,
+                    kd_str,
+                )
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
