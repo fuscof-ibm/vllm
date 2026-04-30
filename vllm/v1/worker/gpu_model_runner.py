@@ -1637,6 +1637,29 @@ class GPUModelRunner(
             num_reqs,
             ctx.block_size,
         )
+
+        # Diagnostic: check if kernel modified state at all (should be no-op
+        # when src==dest and atb==0).
+        for layer_name in kernel_states:
+            if layer_name in pre_kernel_states:
+                for si, (ks, pks) in enumerate(
+                    zip(kernel_states[layer_name], pre_kernel_states[layer_name])
+                ):
+                    if not torch.equal(ks, pks):
+                        d = (
+                            (ks != pks)
+                            .any(dim=tuple(range(1, ks.dim())))
+                            .nonzero()
+                            .flatten()
+                        )
+                        logger.warning(
+                            "KERNEL MODIFIED STATE layer=%s state=%d "
+                            "diff_blocks=%s (kernel is NOT a no-op!)",
+                            layer_name,
+                            si,
+                            d.tolist(),
+                        )
+
         for layer_name in kernel_states:
             attn = fwd_ctx[layer_name]
             for state_idx, (kern_s, ref_s_gpu) in enumerate(
@@ -1644,6 +1667,26 @@ class GPUModelRunner(
             ):
                 ref_s = ref_s_gpu.cpu()
                 if not torch.equal(kern_s, ref_s):
+                    kern_nan = torch.isnan(kern_s)
+                    ref_nan = torch.isnan(ref_s)
+                    nan_only = torch.equal(kern_nan, ref_nan) and torch.equal(
+                        kern_s.nan_to_num(), ref_s.nan_to_num()
+                    )
+                    if nan_only:
+                        nan_blocks = (
+                            kern_nan.any(dim=tuple(range(1, kern_s.dim())))
+                            .nonzero()
+                            .flatten()
+                        )
+                        logger.info(
+                            "MAMBA STATE NaN-only diff (false positive) "
+                            "layer=%s state=%d nan_blocks=%s",
+                            layer_name,
+                            state_idx,
+                            nan_blocks.tolist(),
+                        )
+                        continue
+
                     has_mismatch = True
                     diff_blocks = (
                         (kern_s != ref_s)
@@ -1651,11 +1694,19 @@ class GPUModelRunner(
                         .nonzero()
                         .flatten()
                     )
+                    first_blk = diff_blocks[0].item()
+                    k_vals = kern_s[first_blk].flatten()[:8]
+                    r_vals = ref_s[first_blk].flatten()[:8]
                     logger.warning(
-                        "MAMBA STATE MISMATCH layer=%s state=%d diff_blocks=%s",
+                        "MAMBA STATE MISMATCH layer=%s state=%d "
+                        "diff_blocks=%s kern[%d]=%s ref[%d]=%s",
                         layer_name,
                         state_idx,
                         diff_blocks.tolist(),
+                        first_blk,
+                        k_vals.tolist(),
+                        first_blk,
+                        r_vals.tolist(),
                     )
 
         if has_mismatch:
