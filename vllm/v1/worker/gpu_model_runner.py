@@ -1855,48 +1855,47 @@ class GPUModelRunner(
                 zip(kernel_states[layer_name], attn.kv_cache)
             ):
                 ref_s = ref_s_gpu.cpu()
-                if not torch.equal(kern_s, ref_s):
-                    kern_nan = torch.isnan(kern_s)
-                    ref_nan = torch.isnan(ref_s)
-                    nan_only = torch.equal(kern_nan, ref_nan) and torch.equal(
-                        kern_s.nan_to_num(), ref_s.nan_to_num()
-                    )
-                    if nan_only:
-                        nan_blocks = (
-                            kern_nan.any(dim=tuple(range(1, kern_s.dim())))
-                            .nonzero()
-                            .flatten()
-                        )
-                        logger.info(
-                            "MAMBA STATE NaN-only diff (false positive) "
-                            "layer=%s state=%d nan_blocks=%s",
-                            layer_name,
-                            state_idx,
-                            nan_blocks.tolist(),
-                        )
-                        continue
+                # Element-wise NaN-aware fp-tolerant comparison.
+                # Rules:
+                #   - Both NaN at a position  -> equal (no diff)
+                #   - Only one NaN            -> real diff (nan_mask_diff)
+                #   - Both numeric            -> compare with fp tolerance
+                kern_nan = torch.isnan(kern_s)
+                ref_nan = torch.isnan(ref_s)
+                nan_mask_diff = kern_nan != ref_nan
+                both_numeric = ~kern_nan & ~ref_nan
+                rtol = 1e-5
+                atol = 1e-5
+                value_diff = torch.zeros_like(kern_s, dtype=torch.bool)
+                if both_numeric.any():
+                    abs_diff = (kern_s - ref_s).abs()
+                    tol = atol + rtol * ref_s.abs()
+                    value_diff = both_numeric & (abs_diff > tol)
+                real_diff = nan_mask_diff | value_diff
+                if not real_diff.any():
+                    continue
 
-                    has_mismatch = True
-                    diff_blocks = (
-                        (kern_s != ref_s)
-                        .any(dim=tuple(range(1, kern_s.dim())))
-                        .nonzero()
-                        .flatten()
-                    )
-                    first_blk = diff_blocks[0].item()
-                    k_vals = kern_s[first_blk].flatten()[:8]
-                    r_vals = ref_s[first_blk].flatten()[:8]
-                    logger.warning(
-                        "MAMBA STATE MISMATCH layer=%s state=%d "
-                        "diff_blocks=%s kern[%d]=%s ref[%d]=%s",
-                        layer_name,
-                        state_idx,
-                        diff_blocks.tolist(),
-                        first_blk,
-                        k_vals.tolist(),
-                        first_blk,
-                        r_vals.tolist(),
-                    )
+                has_mismatch = True
+                diff_blocks = (
+                    real_diff.any(dim=tuple(range(1, kern_s.dim()))).nonzero().flatten()
+                )
+                first_blk = diff_blocks[0].item()
+                k_vals = kern_s[first_blk].flatten()[:8]
+                r_vals = ref_s[first_blk].flatten()[:8]
+                logger.warning(
+                    "MAMBA STATE MISMATCH layer=%s state=%d "
+                    "diff_blocks=%s nan_mask_diff=%d value_diff=%d "
+                    "kern[%d]=%s ref[%d]=%s",
+                    layer_name,
+                    state_idx,
+                    diff_blocks.tolist(),
+                    int(nan_mask_diff.sum().item()),
+                    int(value_diff.sum().item()),
+                    first_blk,
+                    k_vals.tolist(),
+                    first_blk,
+                    r_vals.tolist(),
+                )
 
         if has_mismatch:
             self._log_mamba_debug_details(
