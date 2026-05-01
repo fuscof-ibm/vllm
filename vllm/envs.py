@@ -248,6 +248,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_MAMBA_POSTPROCESS: bool = False
     VLLM_DEBUG_MAMBA_ALIGN_REFERENCE: bool = False
     VLLM_DEBUG_MAMBA_KERNEL_INPUTS: bool = False
+    VLLM_DEBUG_MAMBA_KERNEL_SYNC: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
@@ -1675,6 +1676,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEBUG_MAMBA_KERNEL_INPUTS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MAMBA_KERNEL_INPUTS", "0"))
     ),
+    # Force a torch.accelerator.synchronize() immediately after the fused
+    # mamba postprocess kernel. Diagnostic only: if enabling this closes an
+    # accuracy gap that async production exhibits, the kernel's writes
+    # (state copies into attn.kv_cache, num_accepted_tokens_out) are racing
+    # with a downstream consumer that reads without stream ordering.
+    "VLLM_DEBUG_MAMBA_KERNEL_SYNC": lambda: bool(
+        int(os.getenv("VLLM_DEBUG_MAMBA_KERNEL_SYNC", "0"))
+    ),
     # Disable using pytorch's pin memory for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": lambda: bool(
         int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY", "0"))
@@ -1847,6 +1856,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_MAMBA_POSTPROCESS",
         "VLLM_DEBUG_MAMBA_ALIGN_REFERENCE",
         "VLLM_DEBUG_MAMBA_KERNEL_INPUTS",
+        "VLLM_DEBUG_MAMBA_KERNEL_SYNC",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",

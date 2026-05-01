@@ -1554,6 +1554,12 @@ class GPUModelRunner(
                     block_table_gpu=block_table_gpu,
                 )
 
+                if envs.VLLM_DEBUG_MAMBA_KERNEL_SYNC:
+                    # Diagnostic: force a full device sync after the kernel.
+                    # If this closes an accuracy gap the async path exhibits,
+                    # a downstream consumer is racing with kernel writes.
+                    torch.accelerator.synchronize()
+
                 if envs.VLLM_DEBUG_MAMBA_POSTPROCESS:
                     self._validate_mamba_postprocess(
                         ctx,
