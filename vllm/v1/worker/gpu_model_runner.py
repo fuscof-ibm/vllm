@@ -1511,33 +1511,58 @@ class GPUModelRunner(
                             s.cpu().clone() for s in attn.kv_cache
                         ]
 
-            # Run fused GPU postprocess.
-            ctx.run_fused_postprocess(
-                num_reqs=num_reqs,
-                num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
-                mamba_state_idx_gpu=self.mamba_state_idx.gpu,
-                num_scheduled_tokens_gpu=self.num_scheduled_tokens_buf.gpu,
-                num_computed_tokens_gpu=self.num_computed_tokens_buf.gpu,
-                num_draft_tokens_gpu=self.num_draft_tokens_buf.gpu,
-                block_table_gpu=block_table_gpu,
-            )
-
-            if envs.VLLM_DEBUG_MAMBA_POSTPROCESS:
-                self._validate_mamba_postprocess(
-                    ctx,
-                    num_reqs,
-                    mamba_copy_funcs,
-                    pre_kernel_states,
+            if envs.VLLM_DEBUG_MAMBA_ALIGN_REFERENCE:
+                # Diagnostic: bypass fused kernel and run Python reference.
+                # Requires blocking sync of num_accepted_tokens so the
+                # reference can read per-request counts from CPU.
+                assert scheduler_output is not None
+                fwd_ctx = self.compilation_config.static_forward_context
+                for i in range(num_reqs):
+                    self.input_batch.num_accepted_tokens_cpu[i] = (
+                        self.num_accepted_tokens.gpu[i].item()
+                    )
+                copy_bufs = self._get_mamba_copy_bufs()
+                mamba_utils.postprocess_mamba_reference(
                     scheduler_output,
+                    self.kv_cache_config,
+                    self.input_batch,
+                    self.requests,
+                    fwd_ctx,
+                    mamba_copy_funcs,
+                    copy_bufs,
+                )
+                # postprocess_mamba_reference updates num_accepted_tokens_cpu
+                # in place (numpy view over num_accepted_tokens_cpu_tensor),
+                # so no additional copy is needed.
+            else:
+                # Run fused GPU postprocess.
+                ctx.run_fused_postprocess(
+                    num_reqs=num_reqs,
+                    num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
+                    mamba_state_idx_gpu=self.mamba_state_idx.gpu,
+                    num_scheduled_tokens_gpu=self.num_scheduled_tokens_buf.gpu,
+                    num_computed_tokens_gpu=self.num_computed_tokens_buf.gpu,
+                    num_draft_tokens_gpu=self.num_draft_tokens_buf.gpu,
+                    block_table_gpu=block_table_gpu,
                 )
 
-            # Copy from ctx.num_accepted_tokens_out which is pre-initialized
-            # from num_accepted_tokens_gpu. The kernel only overwrites values
-            # to 1 when src_block_idx == dest_block_idx (copy within same block);
-            # for all other requests, the original accepted token count is preserved.
-            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                ctx.num_accepted_tokens_out[:num_reqs], non_blocking=True
-            )
+                if envs.VLLM_DEBUG_MAMBA_POSTPROCESS:
+                    self._validate_mamba_postprocess(
+                        ctx,
+                        num_reqs,
+                        mamba_copy_funcs,
+                        pre_kernel_states,
+                        scheduler_output,
+                    )
+
+                # Copy from ctx.num_accepted_tokens_out which is pre-initialized
+                # from num_accepted_tokens_gpu. The kernel only overwrites values
+                # to 1 when src_block_idx == dest_block_idx (copy within same
+                # block); for all other requests, the original accepted count
+                # is preserved.
+                self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                    ctx.num_accepted_tokens_out[:num_reqs], non_blocking=True
+                )
         else:
             self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                 self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
