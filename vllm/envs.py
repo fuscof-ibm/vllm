@@ -247,6 +247,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_MFU_METRICS: bool = False
     VLLM_DEBUG_MAMBA_POSTPROCESS: bool = False
     VLLM_DEBUG_MAMBA_ALIGN_REFERENCE: bool = False
+    VLLM_DEBUG_MAMBA_KERNEL_INPUTS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
@@ -1667,6 +1668,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEBUG_MAMBA_ALIGN_REFERENCE": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MAMBA_ALIGN_REFERENCE", "0"))
     ),
+    # Log per-request divergence between the GPU buffers fed to the fused
+    # mamba postprocess kernel and the CPU source-of-truth values the Python
+    # reference would read. Diagnostic only; forces a blocking GPU->CPU sync
+    # of all kernel-input buffers at fire time.
+    "VLLM_DEBUG_MAMBA_KERNEL_INPUTS": lambda: bool(
+        int(os.getenv("VLLM_DEBUG_MAMBA_KERNEL_INPUTS", "0"))
+    ),
     # Disable using pytorch's pin memory for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": lambda: bool(
         int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY", "0"))
@@ -1838,6 +1846,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_LOG_API_SERVER_RESPONSE",
         "VLLM_DEBUG_MAMBA_POSTPROCESS",
         "VLLM_DEBUG_MAMBA_ALIGN_REFERENCE",
+        "VLLM_DEBUG_MAMBA_KERNEL_INPUTS",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",

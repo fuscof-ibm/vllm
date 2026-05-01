@@ -1535,6 +1535,14 @@ class GPUModelRunner(
                 # in place (numpy view over num_accepted_tokens_cpu_tensor),
                 # so no additional copy is needed.
             else:
+                if envs.VLLM_DEBUG_MAMBA_KERNEL_INPUTS:
+                    self._check_mamba_kernel_inputs(
+                        num_reqs,
+                        mamba_group_id,
+                        block_table_gpu,
+                        scheduler_output,
+                    )
+
                 # Run fused GPU postprocess.
                 ctx.run_fused_postprocess(
                     num_reqs=num_reqs,
@@ -1573,6 +1581,96 @@ class GPUModelRunner(
         # record the event for proper synchronization.
         assert self.num_accepted_tokens_event is not None
         self.num_accepted_tokens_event.record()
+
+    def _check_mamba_kernel_inputs(
+        self,
+        num_reqs: int,
+        mamba_group_id: int,
+        block_table_gpu: torch.Tensor,
+        scheduler_output: "SchedulerOutput | None",
+    ) -> None:
+        """Log per-request divergence between GPU buffers fed to the fused
+        mamba postprocess kernel and the CPU source-of-truth values the
+        Python reference would read.
+
+        Blocking sync: only enable via VLLM_DEBUG_MAMBA_KERNEL_INPUTS.
+        """
+        assert scheduler_output is not None
+
+        num_accepted_gpu = self.num_accepted_tokens.gpu[:num_reqs].cpu().tolist()
+        mamba_state_idx_gpu = self.mamba_state_idx.gpu[:num_reqs].cpu().tolist()
+        num_sched_gpu = self.num_scheduled_tokens_buf.gpu[:num_reqs].cpu().tolist()
+        num_comp_gpu = self.num_computed_tokens_buf.gpu[:num_reqs].cpu().tolist()
+        num_draft_gpu = self.num_draft_tokens_buf.gpu[:num_reqs].cpu().tolist()
+        block_table_cpu = block_table_gpu[:num_reqs].cpu()
+
+        spec_dict = scheduler_output.scheduled_spec_decode_tokens
+        sched_dict = scheduler_output.num_scheduled_tokens
+
+        for i in range(num_reqs):
+            req_id = self.input_batch.req_ids[i]
+            req_state = self.requests[req_id]
+
+            cpu_state_idx = int(self.input_batch.mamba_state_idx_cpu[i])
+            cpu_num_sched = int(sched_dict[req_id])
+            cpu_num_comp = int(req_state.num_computed_tokens)
+            cpu_num_draft = len(spec_dict.get(req_id, []))
+            cpu_blocks = req_state.block_ids[mamba_group_id]
+
+            if int(mamba_state_idx_gpu[i]) != cpu_state_idx:
+                logger.warning(
+                    "GPU_INPUT_STALE req_id=%s i=%d field=mamba_state_idx "
+                    "gpu=%d cpu=%d",
+                    req_id,
+                    i,
+                    int(mamba_state_idx_gpu[i]),
+                    cpu_state_idx,
+                )
+            if int(num_sched_gpu[i]) != cpu_num_sched:
+                logger.warning(
+                    "GPU_INPUT_STALE req_id=%s i=%d field=num_scheduled gpu=%d cpu=%d",
+                    req_id,
+                    i,
+                    int(num_sched_gpu[i]),
+                    cpu_num_sched,
+                )
+            if int(num_comp_gpu[i]) != cpu_num_comp:
+                logger.warning(
+                    "GPU_INPUT_STALE req_id=%s i=%d field=num_computed gpu=%d cpu=%d",
+                    req_id,
+                    i,
+                    int(num_comp_gpu[i]),
+                    cpu_num_comp,
+                )
+            if int(num_draft_gpu[i]) != cpu_num_draft:
+                logger.warning(
+                    "GPU_INPUT_STALE req_id=%s i=%d field=num_draft gpu=%d cpu=%d",
+                    req_id,
+                    i,
+                    int(num_draft_gpu[i]),
+                    cpu_num_draft,
+                )
+            cpu_blocks_cmp = list(cpu_blocks[: block_table_cpu.shape[1]])
+            gpu_blocks_cmp = block_table_cpu[i, : len(cpu_blocks_cmp)].tolist()
+            if [int(x) for x in gpu_blocks_cmp] != [int(x) for x in cpu_blocks_cmp]:
+                first_diff = next(
+                    (
+                        k
+                        for k in range(len(cpu_blocks_cmp))
+                        if int(gpu_blocks_cmp[k]) != int(cpu_blocks_cmp[k])
+                    ),
+                    -1,
+                )
+                logger.warning(
+                    "GPU_INPUT_STALE req_id=%s i=%d field=block_table "
+                    "first_diff_idx=%d gpu=%s cpu=%s",
+                    req_id,
+                    i,
+                    first_diff,
+                    gpu_blocks_cmp[:8],
+                    cpu_blocks_cmp[:8],
+                )
+            _ = num_accepted_gpu  # currently a sanity-only read
 
     def _validate_mamba_postprocess(
         self,
