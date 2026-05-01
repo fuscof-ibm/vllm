@@ -9,6 +9,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config import CacheConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     get_conv_copy_spec,
@@ -21,6 +22,8 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+
+logger = init_logger(__name__)
 
 
 @triton.jit
@@ -596,6 +599,8 @@ def postprocess_mamba_reference(
     scheduled_spec_decode_tokens_dict = scheduler_output.scheduled_spec_decode_tokens
     num_accepted_tokens_cpu = input_batch.num_accepted_tokens_cpu
     mamba_state_idx_cpu = input_batch.mamba_state_idx_cpu
+    shadow = input_batch.mamba_state_idx_shadow
+    use_shadow = envs.VLLM_DEBUG_MAMBA_ALIGN_REFERENCE and shadow is not None
     mamba_group_ids = copy_bufs.mamba_group_ids
     mamba_spec = copy_bufs.mamba_spec
     copy_bufs.offset = 0
@@ -614,7 +619,19 @@ def postprocess_mamba_reference(
         )
         if aligned_new_computed_tokens >= num_tokens_running_state:
             accept_token_bias = aligned_new_computed_tokens - num_tokens_running_state
-            src_block_idx = mamba_state_idx_cpu[i]
+            tensor_src = int(mamba_state_idx_cpu[i])
+            if use_shadow:
+                src_block_idx = shadow.get(req_id, tensor_src)
+                if src_block_idx != tensor_src:
+                    logger.warning(
+                        "MAMBA SHADOW DIVERGENCE req_id=%s i=%d shadow=%d tensor=%d",
+                        req_id,
+                        i,
+                        src_block_idx,
+                        tensor_src,
+                    )
+            else:
+                src_block_idx = tensor_src
             dest_block_idx = aligned_new_computed_tokens // mamba_spec.block_size - 1
             collect_mamba_copy_meta(
                 copy_bufs,
@@ -671,15 +688,22 @@ def preprocess_mamba(
     finished_req_ids = scheduler_output.finished_req_ids
     preempted_req_ids = scheduler_output.preempted_req_ids or set()
     resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+    shadow = input_batch.mamba_state_idx_shadow
+    use_shadow = envs.VLLM_DEBUG_MAMBA_ALIGN_REFERENCE and shadow is not None
     for req_id in itertools.chain(finished_req_ids, preempted_req_ids, resumed_req_ids):
         req_index = input_batch.req_id_to_index.get(req_id)
         if req_index is not None:
             input_batch.mamba_state_idx_cpu[req_index] = -1
+        if shadow is not None:
+            shadow.pop(req_id, None)
 
     copy_bufs.offset = 0
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
-        prev_state_idx = input_batch.mamba_state_idx_cpu[i]
+        if use_shadow:
+            prev_state_idx = shadow.get(req_id, -1)
+        else:
+            prev_state_idx = input_batch.mamba_state_idx_cpu[i]
         if prev_state_idx == -1:
             # new / resumed request, no previous state
             # if num_computed_tokens is 0, prev_state_idx will be -1
@@ -703,6 +727,8 @@ def preprocess_mamba(
         # And use block 1 to save the running state.
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
         input_batch.mamba_state_idx_cpu[i] = curr_state_idx
+        if shadow is not None:
+            shadow[req_id] = curr_state_idx
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
             collect_mamba_copy_meta(
                 copy_bufs,

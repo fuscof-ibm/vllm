@@ -240,9 +240,15 @@ class InputBatch:
             self.mamba_state_idx_cpu: np.ndarray | None = (
                 self.mamba_state_idx_cpu_tensor.numpy()
             )
+            # Diagnostic shadow, keyed by req_id (immune to swap/condense).
+            # Used when VLLM_DEBUG_MAMBA_ALIGN_REFERENCE=1 to bisect whether
+            # an accuracy regression lives in the tensor-based req_index
+            # bookkeeping vs elsewhere.
+            self.mamba_state_idx_shadow: dict[str, int] | None = {}
         else:
             self.mamba_state_idx_cpu_tensor = None
             self.mamba_state_idx_cpu = None
+            self.mamba_state_idx_shadow = None
 
         # lora related
         self.request_lora_mapping = np.zeros((self.max_num_reqs,), dtype=np.int64)
@@ -469,6 +475,8 @@ class InputBatch:
         # Mamba state: -1 means compute from num_computed_tokens (new request)
         if self.mamba_state_idx_cpu is not None:
             self.mamba_state_idx_cpu[req_index] = -1
+        if self.mamba_state_idx_shadow is not None:
+            self.mamba_state_idx_shadow.pop(req_id, None)
 
         # Add request lora ID
         if request.lora_request:
@@ -534,6 +542,8 @@ class InputBatch:
         # Reset mamba state index
         if self.mamba_state_idx_cpu is not None:
             self.mamba_state_idx_cpu[req_index] = -1
+        if self.mamba_state_idx_shadow is not None:
+            self.mamba_state_idx_shadow.pop(req_id, None)
 
         # LoRA
         lora_id = self.request_lora_mapping[req_index]
