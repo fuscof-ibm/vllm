@@ -1543,6 +1543,9 @@ class GPUModelRunner(
                         scheduler_output,
                     )
 
+                if envs.VLLM_DEBUG_MAMBA_KERNEL_ADDRS:
+                    self._check_mamba_kernel_addrs(ctx)
+
                 # Run fused GPU postprocess.
                 ctx.run_fused_postprocess(
                     num_reqs=num_reqs,
@@ -1587,6 +1590,59 @@ class GPUModelRunner(
         # record the event for proper synchronization.
         assert self.num_accepted_tokens_event is not None
         self.num_accepted_tokens_event.record()
+
+    def _check_mamba_kernel_addrs(
+        self,
+        ctx: "mamba_utils.MambaGPUContext",
+    ) -> None:
+        """Log divergence between cached MambaGPUContext pointers/strides and
+        the live data_ptr/stride of each kv_cache tensor.
+
+        state_base_addrs / state_block_strides are populated once at
+        initialize_from_forward_context and reused by the fused kernel on
+        every iter. If a kv_cache tensor is ever reassigned/reallocated
+        after init, the kernel writes to stale memory while the Python
+        reference and the per-iter validator both read from the live
+        tensor, so the divergence is invisible per-iter but accumulates
+        over the run.
+
+        Blocking sync: only enable via VLLM_DEBUG_MAMBA_KERNEL_ADDRS.
+        """
+        fwd_ctx = self.compilation_config.static_forward_context
+        cached_addrs = ctx.state_base_addrs.cpu().tolist()
+        cached_strides = ctx.state_block_strides.cpu().tolist()
+        idx = 0
+        for mamba_group_id in ctx.mamba_group_ids:
+            layer_names = self.kv_cache_config.kv_cache_groups[
+                mamba_group_id
+            ].layer_names
+            for layer_name in layer_names:
+                attention = fwd_ctx[layer_name]
+                for state in attention.kv_cache:
+                    live_addr = state.data_ptr()
+                    if state.dim() > 1:
+                        live_stride = state.stride(0) * state.element_size()
+                    else:
+                        live_stride = state.numel() * state.element_size()
+                    if cached_addrs[idx] != live_addr:
+                        logger.warning(
+                            "KERNEL ADDR STALE layer=%s idx=%d "
+                            "cached_addr=0x%x live_addr=0x%x",
+                            layer_name,
+                            idx,
+                            cached_addrs[idx],
+                            live_addr,
+                        )
+                    if cached_strides[idx] != live_stride:
+                        logger.warning(
+                            "KERNEL STRIDE STALE layer=%s idx=%d "
+                            "cached_stride=%d live_stride=%d",
+                            layer_name,
+                            idx,
+                            cached_strides[idx],
+                            live_stride,
+                        )
+                    idx += 1
 
     def _check_mamba_kernel_inputs(
         self,

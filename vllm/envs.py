@@ -249,6 +249,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_MAMBA_ALIGN_REFERENCE: bool = False
     VLLM_DEBUG_MAMBA_KERNEL_INPUTS: bool = False
     VLLM_DEBUG_MAMBA_KERNEL_SYNC: bool = False
+    VLLM_DEBUG_MAMBA_KERNEL_ADDRS: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
@@ -1684,6 +1685,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEBUG_MAMBA_KERNEL_SYNC": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MAMBA_KERNEL_SYNC", "0"))
     ),
+    # Compare MambaGPUContext.state_base_addrs / state_block_strides (cached
+    # once at initialize_from_forward_context) against live values read from
+    # forward_context on every iter. If any divergence is logged as
+    # "KERNEL ADDR STALE", a kv_cache tensor's data_ptr or block stride has
+    # changed since init and the fused kernel has been writing to stale
+    # memory — which the per-iter validator cannot detect (it reads from
+    # the live tensor, so kernel writes to stale addresses simply don't
+    # appear in either side of the comparison).
+    "VLLM_DEBUG_MAMBA_KERNEL_ADDRS": lambda: bool(
+        int(os.getenv("VLLM_DEBUG_MAMBA_KERNEL_ADDRS", "0"))
+    ),
     # Disable using pytorch's pin memory for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": lambda: bool(
         int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY", "0"))
@@ -1857,6 +1869,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_MAMBA_ALIGN_REFERENCE",
         "VLLM_DEBUG_MAMBA_KERNEL_INPUTS",
         "VLLM_DEBUG_MAMBA_KERNEL_SYNC",
+        "VLLM_DEBUG_MAMBA_KERNEL_ADDRS",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
