@@ -704,12 +704,64 @@ def preprocess_mamba(
             prev_state_idx = shadow.get(req_id, -1)
         else:
             prev_state_idx = input_batch.mamba_state_idx_cpu[i]
+        prev_state_idx_was_minus_one = prev_state_idx == -1
         if prev_state_idx == -1:
             # new / resumed request, no previous state
             # if num_computed_tokens is 0, prev_state_idx will be -1
             prev_state_idx = (req_state.num_computed_tokens - 1) // block_size
 
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+
+        # Diagnostic: the fallback path `(num_computed - 1) // block_size`
+        # produces a non-(-1) index whenever num_computed_tokens > 0. That
+        # index is then treated as a pointer to a prior-chunk running mamba
+        # state. If the block there was freshly allocated (no prior state
+        # written), collect_mamba_copy_meta will copy uninitialized / stale
+        # data into the running-state slot before the forward pass, poisoning
+        # the target-model logits. Log every time we hit this branch with
+        # num_computed > 0, and sample the source block contents.
+        if (
+            envs.VLLM_DEBUG_MAMBA_PREV_STATE
+            and prev_state_idx_was_minus_one
+            and req_state.num_computed_tokens > 0
+        ):
+            is_resumed = req_id in resumed_req_ids
+            src_stats: list[str] = []
+            for mamba_group_id in mamba_group_ids:
+                block_ids = req_state.block_ids[mamba_group_id]
+                if 0 <= prev_state_idx < len(block_ids):
+                    src_block_id = block_ids[prev_state_idx]
+                    layer_names = kv_cache_config.kv_cache_groups[
+                        mamba_group_id
+                    ].layer_names
+                    if layer_names:
+                        attn = forward_context.get(layer_names[0])
+                        if attn is not None and hasattr(attn, "kv_cache"):
+                            for si, state in enumerate(attn.kv_cache):
+                                if 0 <= src_block_id < state.size(0):
+                                    blk = state[src_block_id]
+                                    n_nan = int(torch.isnan(blk).sum().item())
+                                    n_zero = int((blk == 0).sum().item())
+                                    n_total = blk.numel()
+                                    src_stats.append(
+                                        f"layer={layer_names[0]} state={si} "
+                                        f"nan={n_nan}/{n_total} "
+                                        f"zero={n_zero}/{n_total}"
+                                    )
+            logger.warning(
+                "MAMBA PREV_STATE FALLBACK req=%s resumed=%s "
+                "num_computed=%d num_scheduled=%d block_size=%d "
+                "prev_state_idx=%d curr_computed_block=%d src_block_stats=%s",
+                req_id,
+                is_resumed,
+                req_state.num_computed_tokens,
+                num_scheduled_tokens,
+                block_size,
+                prev_state_idx,
+                (req_state.num_computed_tokens - 1) // block_size,
+                " | ".join(src_stats) if src_stats else "(none)",
+            )
+
         num_blocks: int = (
             cdiv(req_state.num_computed_tokens + num_scheduled_tokens, block_size)
             + num_speculative_blocks

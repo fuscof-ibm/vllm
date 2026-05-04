@@ -250,6 +250,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_MAMBA_KERNEL_INPUTS: bool = False
     VLLM_DEBUG_MAMBA_KERNEL_SYNC: bool = False
     VLLM_DEBUG_MAMBA_KERNEL_ADDRS: bool = False
+    VLLM_DEBUG_MAMBA_PREV_STATE: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
@@ -1696,6 +1697,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEBUG_MAMBA_KERNEL_ADDRS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MAMBA_KERNEL_ADDRS", "0"))
     ),
+    # Log whenever preprocess_mamba hits the fallback
+    # `prev_state_idx = (num_computed_tokens - 1) // block_size` branch with
+    # num_computed_tokens > 0 (new/resumed/preempted request that is NOT at
+    # position 0). This branch assumes block_ids[prev_state_idx] already
+    # contains a valid running mamba state from a prior chunk. Under PC-ON
+    # with chunked prefill (required by mamba_cache_mode="align"), the
+    # source block may actually be freshly allocated and hold uninitialized
+    # / stale data — which then gets copied into the running-state slot
+    # before the forward pass runs.  The diagnostic also samples the source
+    # block contents and reports NaN / all-zero / finite counts so we can
+    # tell whether the copy source looks like a real mamba state.
+    "VLLM_DEBUG_MAMBA_PREV_STATE": lambda: bool(
+        int(os.getenv("VLLM_DEBUG_MAMBA_PREV_STATE", "0"))
+    ),
     # Disable using pytorch's pin memory for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": lambda: bool(
         int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY", "0"))
@@ -1870,6 +1885,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_MAMBA_KERNEL_INPUTS",
         "VLLM_DEBUG_MAMBA_KERNEL_SYNC",
         "VLLM_DEBUG_MAMBA_KERNEL_ADDRS",
+        "VLLM_DEBUG_MAMBA_PREV_STATE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
