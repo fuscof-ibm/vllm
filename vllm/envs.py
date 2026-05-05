@@ -250,6 +250,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_MAMBA_KERNEL_INPUTS: bool = False
     VLLM_DEBUG_MAMBA_KERNEL_SYNC: bool = False
     VLLM_DEBUG_MAMBA_KERNEL_ADDRS: bool = False
+    VLLM_DEBUG_MAMBA_KERNEL_BLOCK_ADDRS: bool = False
     VLLM_DEBUG_MAMBA_PREV_STATE: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
@@ -1697,6 +1698,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEBUG_MAMBA_KERNEL_ADDRS": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MAMBA_KERNEL_ADDRS", "0"))
     ),
+    # Per-request per-block address validator. For every in-flight request and
+    # every mamba state, compare the kernel's computed block addresses
+    # (state_base_addr + block_id * state_block_stride [+ src_offset]) against
+    # the live tensor's state[block_id].data_ptr() (and state[block_id, bias:]
+    # for conv states). Catches divergence that _KERNEL_ADDRS misses because
+    # _KERNEL_ADDRS only checks base_addr and stride(0), not per-block offsets
+    # that could drift under as_strided / layout remap.
+    # Blocking sync (full device sync before validation).
+    "VLLM_DEBUG_MAMBA_KERNEL_BLOCK_ADDRS": lambda: bool(
+        int(os.getenv("VLLM_DEBUG_MAMBA_KERNEL_BLOCK_ADDRS", "0"))
+    ),
     # Log whenever preprocess_mamba hits the fallback
     # `prev_state_idx = (num_computed_tokens - 1) // block_size` branch with
     # num_computed_tokens > 0 (new/resumed/preempted request that is NOT at
@@ -1885,6 +1897,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_MAMBA_KERNEL_INPUTS",
         "VLLM_DEBUG_MAMBA_KERNEL_SYNC",
         "VLLM_DEBUG_MAMBA_KERNEL_ADDRS",
+        "VLLM_DEBUG_MAMBA_KERNEL_BLOCK_ADDRS",
         "VLLM_DEBUG_MAMBA_PREV_STATE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",

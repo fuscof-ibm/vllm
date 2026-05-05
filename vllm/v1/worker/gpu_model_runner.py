@@ -1546,6 +1546,15 @@ class GPUModelRunner(
                 if envs.VLLM_DEBUG_MAMBA_KERNEL_ADDRS:
                     self._check_mamba_kernel_addrs(ctx)
 
+                if envs.VLLM_DEBUG_MAMBA_KERNEL_BLOCK_ADDRS:
+                    assert scheduler_output is not None
+                    self._check_mamba_kernel_block_addrs(
+                        ctx,
+                        num_reqs,
+                        block_table_gpu,
+                        scheduler_output,
+                    )
+
                 # Run fused GPU postprocess.
                 ctx.run_fused_postprocess(
                     num_reqs=num_reqs,
@@ -1643,6 +1652,143 @@ class GPUModelRunner(
                             live_stride,
                         )
                     idx += 1
+
+    def _check_mamba_kernel_block_addrs(
+        self,
+        ctx: "mamba_utils.MambaGPUContext",
+        num_reqs: int,
+        block_table_gpu: torch.Tensor,
+        scheduler_output: "SchedulerOutput",
+    ) -> None:
+        """Per-request per-block address validator.
+
+        For each in-flight request and each mamba state, compute the source
+        and destination addresses the fused kernel would produce from cached
+        metadata (`state_base_addr + block_id * state_block_stride` plus the
+        conv `src_offset`) and compare against live tensor indexing
+        (`state[block_id].data_ptr()` / `state[block_id, bias:].data_ptr()`).
+
+        Catches divergence that `_check_mamba_kernel_addrs` misses: that one
+        only validates base ptr + stride(0), so inner-stride drift or a
+        layout remap that only shows up at specific block offsets would be
+        invisible.
+
+        Blocking sync: forces full device sync before reading, intended for
+        diagnosis only.
+        """
+        import vllm.model_executor.layers.mamba.mamba_utils as mm_utils
+
+        torch.accelerator.synchronize()
+        fwd_ctx = self.compilation_config.static_forward_context
+
+        mamba_state_idx_cpu = self.mamba_state_idx.gpu[:num_reqs].cpu().tolist()
+        num_accepted_cpu = self.num_accepted_tokens.gpu[:num_reqs].cpu().tolist()
+        block_table_cpu = block_table_gpu[:num_reqs].cpu().tolist()
+
+        sched_dict = scheduler_output.num_scheduled_tokens
+        spec_dict = scheduler_output.scheduled_spec_decode_tokens
+        block_size = ctx.block_size
+
+        cached_addrs = ctx.state_base_addrs.cpu().tolist()
+        cached_strides = ctx.state_block_strides.cpu().tolist()
+        cached_inner = ctx.state_inner_sizes.cpu().tolist()
+        cached_elem = ctx.state_elem_sizes.cpu().tolist()
+        cached_conv_w = ctx.state_conv_widths.cpu().tolist()
+
+        dim_first = mm_utils.is_conv_state_dim_first()
+
+        for i in range(num_reqs):
+            req_id = self.input_batch.req_ids[i]
+            req_state = self.requests[req_id]
+            num_scheduled = int(sched_dict[req_id])
+            num_draft = len(spec_dict.get(req_id, []))
+            num_computed = int(req_state.num_computed_tokens)
+            num_accepted = int(num_accepted_cpu[i])
+            num_tokens_running = num_computed + num_scheduled - num_draft
+            new_num_computed = num_tokens_running + num_accepted - 1
+            aligned_new = (new_num_computed // block_size) * block_size
+            if aligned_new < num_tokens_running:
+                continue
+            bias = aligned_new - num_tokens_running
+            src_block_idx = int(mamba_state_idx_cpu[i])
+            dest_block_idx = aligned_new // block_size - 1
+
+            idx = 0
+            for mamba_group_id in ctx.mamba_group_ids:
+                layer_names = self.kv_cache_config.kv_cache_groups[
+                    mamba_group_id
+                ].layer_names
+                for layer_name in layer_names:
+                    attention = fwd_ctx[layer_name]
+                    for st_i, state in enumerate(attention.kv_cache):
+                        base = cached_addrs[idx]
+                        block_stride = cached_strides[idx]
+                        inner = cached_inner[idx]
+                        elem = cached_elem[idx]
+                        conv_w = cached_conv_w[idx]
+
+                        src_block_id = int(block_table_cpu[i][src_block_idx])
+                        dest_block_id = int(block_table_cpu[i][dest_block_idx])
+
+                        if conv_w > 0:
+                            if dim_first and bias > 0:
+                                idx += 1
+                                continue
+                            kernel_src = (
+                                base
+                                + src_block_id * block_stride
+                                + (bias * inner * elem)
+                            )
+                            live_src = (
+                                state[src_block_id, bias:].data_ptr()
+                                if state.dim() > 1 and bias > 0
+                                else state[src_block_id].data_ptr()
+                            )
+                        else:
+                            actual_src_idx = src_block_idx + bias
+                            actual_src_id = int(block_table_cpu[i][actual_src_idx])
+                            kernel_src = base + actual_src_id * block_stride
+                            live_src = state[actual_src_id].data_ptr()
+
+                        kernel_dst = base + dest_block_id * block_stride
+                        live_dst = state[dest_block_id].data_ptr()
+
+                        if kernel_src != live_src:
+                            logger.warning(
+                                "KERNEL BLOCK SRC DRIFT req=%s i=%d "
+                                "layer=%s state=%d idx=%d conv_w=%d bias=%d "
+                                "src_block_id=%d kernel=0x%x live=0x%x "
+                                "delta=%d",
+                                req_id,
+                                i,
+                                layer_name,
+                                st_i,
+                                idx,
+                                conv_w,
+                                bias,
+                                src_block_id,
+                                kernel_src,
+                                live_src,
+                                kernel_src - live_src,
+                            )
+                        if kernel_dst != live_dst:
+                            logger.warning(
+                                "KERNEL BLOCK DST DRIFT req=%s i=%d "
+                                "layer=%s state=%d idx=%d conv_w=%d "
+                                "dest_block_id=%d kernel=0x%x live=0x%x "
+                                "delta=%d",
+                                req_id,
+                                i,
+                                layer_name,
+                                st_i,
+                                idx,
+                                conv_w,
+                                dest_block_id,
+                                kernel_dst,
+                                live_dst,
+                                kernel_dst - live_dst,
+                            )
+                        idx += 1
 
     def _check_mamba_kernel_inputs(
         self,
