@@ -1484,7 +1484,8 @@ class GPUModelRunner(
 
             # Initialize metadata from forward_context if not done yet.
             ctx = self.mamba_gpu_postprocess_ctx
-            if not ctx.is_initialized:
+            just_initialized = not ctx.is_initialized
+            if just_initialized:
                 ctx.initialize_from_forward_context(
                     self.kv_cache_config,
                     self.compilation_config.static_forward_context,
@@ -1498,6 +1499,32 @@ class GPUModelRunner(
             block_table_gpu = self.input_batch.block_table[
                 mamba_group_id
             ].get_device_tensor(num_reqs)
+
+            if just_initialized:
+                # One-shot summary of the mamba-group block table layout.
+                # If use_hybrid_blocks is True, block_table_gpu[req, i] holds
+                # a KERNEL block id — i.e. each KV-manager block id from
+                # req_state.block_ids has been expanded into blocks_per_kv_block
+                # contiguous entries. The fused kernel indexes block_table_gpu
+                # directly, while the Python reference indexes
+                # req_state.block_ids. They disagree whenever blocks_per_kv_block
+                # != 1 for the mamba group.
+                mamba_bt = self.input_batch.block_table[mamba_group_id]
+                logger.warning(
+                    "MAMBA CTX INIT mamba_group_ids=%s num_layers=%d "
+                    "num_state_types=%d block_size=%d use_hybrid_blocks=%s "
+                    "blocks_per_kv_block=%d bt_block_size=%d "
+                    "max_num_blocks_per_req=%d bt_gpu_shape=%s",
+                    ctx.mamba_group_ids,
+                    ctx.num_layers,
+                    ctx.num_state_types,
+                    ctx.block_size,
+                    mamba_bt.use_hybrid_blocks,
+                    mamba_bt.blocks_per_kv_block,
+                    mamba_bt.block_size,
+                    mamba_bt.max_num_blocks_per_req,
+                    tuple(mamba_bt.block_table.gpu.shape),
+                )
 
             # Snapshot mamba states before kernel (for debug validation).
             # Sync first to ensure all forward pass writes have landed.
