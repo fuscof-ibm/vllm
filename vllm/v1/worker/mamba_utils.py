@@ -117,10 +117,16 @@ def postprocess_mamba_fused_kernel(
 
     # Load block IDs from block table. Cast to typed pointer BEFORE arithmetic
     # to ensure element-wise (not byte-wise) pointer advancement.
+    # Promote loaded block ids to int64 *before* multiplying with the int64
+    # block stride. block_table stores int32 ids; state_block_stride can be
+    # tens of GB (base_addr + block_id * stride). Without the explicit cast
+    # Triton may evaluate `block_id * stride` as int32, silently truncating
+    # the product once block_id * stride exceeds 2**31 and producing a
+    # wrong src/dst address for large mamba caches.
     block_table_typed = block_table_ptr.to(tl.pointer_type(tl.int32))
     block_table_base = block_table_typed + req_idx * block_table_stride_req
-    src_block_id = tl.load(block_table_base + src_block_idx)
-    dest_block_id = tl.load(block_table_base + dest_block_idx)
+    src_block_id = tl.load(block_table_base + src_block_idx).to(tl.int64)
+    dest_block_id = tl.load(block_table_base + dest_block_idx).to(tl.int64)
 
     # Compute source and destination addresses based on state type
     # conv_width > 0 means this is a conv state (get_conv_copy_spec logic)
@@ -131,19 +137,23 @@ def postprocess_mamba_fused_kernel(
         # Conv state: copy from state[src_block_id, accept_token_bias:] to
         # state[dest_block_id] Source offset is accept_token_bias elements into
         # the conv dimension
-        src_offset = accept_token_bias * state_inner_size * state_elem_size
+        src_offset = accept_token_bias.to(tl.int64) * state_inner_size * state_elem_size
         src_addr = state_base_addr + src_block_id * state_block_stride + src_offset
         dst_addr = state_base_addr + dest_block_id * state_block_stride
         # Number of elements to copy:
         # (conv_width - accept_token_bias) * inner_size
-        num_elems_to_copy = (conv_width - accept_token_bias) * state_inner_size
+        num_elems_to_copy = (conv_width - accept_token_bias).to(
+            tl.int64
+        ) * state_inner_size
         copy_size = num_elems_to_copy * state_elem_size
         debug_src_phys = src_block_id
     else:
         # Temporal state: copy from state[src_block_id + accept_token_bias]
         # to state[dest_block_id]
         actual_src_block_idx = src_block_idx + accept_token_bias
-        actual_src_block_id = tl.load(block_table_base + actual_src_block_idx)
+        actual_src_block_id = tl.load(block_table_base + actual_src_block_idx).to(
+            tl.int64
+        )
         src_addr = state_base_addr + actual_src_block_id * state_block_stride
         dst_addr = state_base_addr + dest_block_id * state_block_stride
         # Use natural block data size (inner_size * elem_size), NOT
