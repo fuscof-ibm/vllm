@@ -1526,6 +1526,57 @@ class GPUModelRunner(
                     tuple(mamba_bt.block_table.gpu.shape),
                 )
 
+            if envs.VLLM_DEBUG_MAMBA_BLOCK_TABLE:
+                # Per-request block-id discrepancy log (once per req_id).
+                # The Python reference reads req_state.block_ids[mamba_group]
+                # (KV-manager block ids). The fused kernel reads
+                # block_table_gpu[req, :] — which is expanded to kernel block
+                # ids via map_to_kernel_blocks when use_hybrid_blocks is True.
+                # Logging both side-by-side makes the disagreement visible
+                # without re-deriving it from the layout summary.
+                mamba_bt = self.input_batch.block_table[mamba_group_id]
+                seen = getattr(self, "_mamba_bt_logged", None)
+                if seen is None:
+                    seen = set()
+                    self._mamba_bt_logged = seen
+                # Materialize the GPU block table slice once per debug call.
+                bt_cpu = mamba_bt.block_table.gpu[:num_reqs].cpu().tolist()
+                for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                    if req_id in seen:
+                        continue
+                    seen.add(req_id)
+                    req_state = self.requests.get(req_id)
+                    if req_state is None:
+                        continue
+                    cpu_ids = list(req_state.block_ids[mamba_group_id])
+                    gpu_row = bt_cpu[i]
+                    # Trim GPU row to the number of populated kernel blocks
+                    # (len(cpu_ids) * blocks_per_kv_block). Entries past that
+                    # are stale / zero-filled allocation padding.
+                    populated = len(cpu_ids) * mamba_bt.blocks_per_kv_block
+                    gpu_row_trimmed = gpu_row[:populated]
+                    # Expected GPU row, if map_to_kernel_blocks were applied
+                    # deterministically: for each kv_id k, emit
+                    # [k*bpk, k*bpk+1, ..., k*bpk+bpk-1].
+                    bpk = mamba_bt.blocks_per_kv_block
+                    expected = [k * bpk + off for k in cpu_ids for off in range(bpk)]
+                    matches = expected == gpu_row_trimmed
+                    logger.warning(
+                        "MAMBA BT DIFF req=%s use_hybrid=%s bpk=%d "
+                        "cpu_block_ids(len=%d)=%s gpu_row(len=%d)=%s "
+                        "expected_from_cpu(len=%d)=%s matches=%s",
+                        req_id,
+                        mamba_bt.use_hybrid_blocks,
+                        bpk,
+                        len(cpu_ids),
+                        cpu_ids,
+                        len(gpu_row_trimmed),
+                        gpu_row_trimmed,
+                        len(expected),
+                        expected,
+                        matches,
+                    )
+
             # Snapshot mamba states before kernel (for debug validation).
             # Sync first to ensure all forward pass writes have landed.
             pre_kernel_states: dict[str, list[torch.Tensor]] = {}

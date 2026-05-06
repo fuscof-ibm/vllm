@@ -252,6 +252,7 @@ if TYPE_CHECKING:
     VLLM_DEBUG_MAMBA_KERNEL_ADDRS: bool = False
     VLLM_DEBUG_MAMBA_KERNEL_BLOCK_ADDRS: bool = False
     VLLM_DEBUG_MAMBA_PREV_STATE: bool = False
+    VLLM_DEBUG_MAMBA_BLOCK_TABLE: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY: bool = False
     VLLM_WEIGHT_OFFLOADING_DISABLE_UVA: bool = False
     VLLM_DISABLE_LOG_LOGO: bool = False
@@ -1723,6 +1724,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_DEBUG_MAMBA_PREV_STATE": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MAMBA_PREV_STATE", "0"))
     ),
+    # Log the per-request block-id discrepancy between
+    # req_state.block_ids[mamba_group_id] (what the Python reference reads)
+    # and block_table_gpu[req, :] (what the fused kernel reads). If
+    # use_hybrid_blocks is True for the mamba group, the two paths disagree
+    # about what each block_table index points to. Logs once per req_id
+    # (first time that req_id is seen at fused-kernel invocation).
+    "VLLM_DEBUG_MAMBA_BLOCK_TABLE": lambda: bool(
+        int(os.getenv("VLLM_DEBUG_MAMBA_BLOCK_TABLE", "0"))
+    ),
     # Disable using pytorch's pin memory for CPU offloading.
     "VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY": lambda: bool(
         int(os.getenv("VLLM_WEIGHT_OFFLOADING_DISABLE_PIN_MEMORY", "0"))
@@ -1899,6 +1909,7 @@ def compile_factors() -> dict[str, object]:
         "VLLM_DEBUG_MAMBA_KERNEL_ADDRS",
         "VLLM_DEBUG_MAMBA_KERNEL_BLOCK_ADDRS",
         "VLLM_DEBUG_MAMBA_PREV_STATE",
+        "VLLM_DEBUG_MAMBA_BLOCK_TABLE",
         "VLLM_TUNED_CONFIG_FOLDER",
         "VLLM_ENGINE_ITERATION_TIMEOUT_S",
         "VLLM_HTTP_TIMEOUT_KEEP_ALIVE",
