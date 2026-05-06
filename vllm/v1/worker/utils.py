@@ -361,7 +361,13 @@ def prepare_kernel_block_sizes(
             )
             kernel_block_sizes.append(selected_kernel_size)
         elif isinstance(kv_cache_spec, MambaSpec):
-            # This is likely Mamba or other non-attention cache, no splitting.
+            # Mamba groups must not split: the fused postprocess kernel indexes
+            # block_table_gpu with block ids produced from req_state.block_ids
+            # by get_temporal_copy_spec / get_conv_copy_spec, which only lines
+            # up when kernel_block_size == kv_cache_spec.block_size
+            # (use_hybrid_blocks=False, blocks_per_kv_block=1). If that ever
+            # changes, update postprocess_mamba_fused_kernel to translate
+            # KV-manager block ids to kernel block ids before indexing.
             kernel_block_sizes.append(kv_cache_spec.block_size)
         else:
             raise NotImplementedError(

@@ -1501,6 +1501,22 @@ class GPUModelRunner(
             ].get_device_tensor(num_reqs)
 
             if just_initialized:
+                # Enforce the 1:1 block-id mapping the fused postprocess kernel
+                # relies on, for every mamba group (NOTE 1 above already assumes
+                # all mamba groups share the same mapping). If this ever fires,
+                # either update the kernel to translate KV-manager block ids to
+                # kernel block ids before indexing, or revert the
+                # prepare_kernel_block_sizes change that broke it.
+                for _gid in ctx.mamba_group_ids:
+                    _bt = self.input_batch.block_table[_gid]
+                    assert not _bt.use_hybrid_blocks and _bt.blocks_per_kv_block == 1, (
+                        f"Mamba group {_gid} has "
+                        f"use_hybrid_blocks={_bt.use_hybrid_blocks} "
+                        f"blocks_per_kv_block={_bt.blocks_per_kv_block}; the "
+                        f"fused postprocess_mamba kernel requires a 1:1 "
+                        f"block-id mapping."
+                    )
+
                 # One-shot summary of the mamba-group block table layout.
                 # If use_hybrid_blocks is True, block_table_gpu[req, i] holds
                 # a KERNEL block id — i.e. each KV-manager block id from
