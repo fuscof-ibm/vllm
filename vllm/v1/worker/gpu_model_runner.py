@@ -1615,6 +1615,13 @@ class GPUModelRunner(
                     self.input_batch.num_accepted_tokens_cpu[i] = (
                         self.num_accepted_tokens.gpu[i].item()
                     )
+                # We validate if the CPU/GPU are in synch
+                self._check_mamba_kernel_inputs(
+                    num_reqs,
+                    mamba_group_id,
+                    block_table_gpu,
+                    scheduler_output,
+                )
                 copy_bufs = self._get_mamba_copy_bufs()
                 mamba_utils.postprocess_mamba_reference(
                     scheduler_output,
@@ -1917,6 +1924,7 @@ class GPUModelRunner(
             cpu_num_sched = int(sched_dict[req_id])
             cpu_num_comp = int(req_state.num_computed_tokens)
             cpu_num_draft = len(spec_dict.get(req_id, []))
+            cpu_num_accepted = int(self.input_batch.num_accepted_tokens_cpu[i])
             cpu_blocks = req_state.block_ids[mamba_group_id]
 
             if int(mamba_state_idx_gpu[i]) != cpu_state_idx:
@@ -1952,6 +1960,14 @@ class GPUModelRunner(
                     int(num_draft_gpu[i]),
                     cpu_num_draft,
                 )
+            if int(num_accepted_gpu[i]) != cpu_num_accepted:
+                logger.warning(
+                    "GPU_INPUT_STALE req_id=%s i=%d field=num_accepted gpu=%d cpu=%d",
+                    req_id,
+                    i,
+                    int(num_accepted_gpu[i]),
+                    cpu_num_accepted,
+                )
             cpu_blocks_cmp = list(cpu_blocks[: block_table_cpu.shape[1]])
             gpu_blocks_cmp = block_table_cpu[i, : len(cpu_blocks_cmp)].tolist()
             if [int(x) for x in gpu_blocks_cmp] != [int(x) for x in cpu_blocks_cmp]:
@@ -1972,7 +1988,6 @@ class GPUModelRunner(
                     gpu_blocks_cmp[:8],
                     cpu_blocks_cmp[:8],
                 )
-            _ = num_accepted_gpu  # currently a sanity-only read
 
     def _validate_mamba_postprocess(
         self,
