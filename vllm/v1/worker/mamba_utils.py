@@ -610,7 +610,6 @@ def postprocess_mamba_reference(
     num_accepted_tokens_cpu = input_batch.num_accepted_tokens_cpu
     mamba_state_idx_cpu = input_batch.mamba_state_idx_cpu
     shadow = input_batch.mamba_state_idx_shadow
-    use_shadow = envs.VLLM_DEBUG_MAMBA_ALIGN_REFERENCE and shadow is not None
     mamba_group_ids = copy_bufs.mamba_group_ids
     mamba_spec = copy_bufs.mamba_spec
     copy_bufs.offset = 0
@@ -629,19 +628,18 @@ def postprocess_mamba_reference(
         )
         if aligned_new_computed_tokens >= num_tokens_running_state:
             accept_token_bias = aligned_new_computed_tokens - num_tokens_running_state
-            tensor_src = int(mamba_state_idx_cpu[i])
-            if use_shadow:
-                src_block_idx = shadow.get(req_id, tensor_src)
-                if src_block_idx != tensor_src:
+            src_block_idx = int(mamba_state_idx_cpu[i])
+            if shadow is not None:
+                shadow_idx = shadow.get(req_id, src_block_idx)
+                if shadow_idx != src_block_idx:
                     logger.warning(
-                        "MAMBA SHADOW DIVERGENCE req_id=%s i=%d shadow=%d tensor=%d",
+                        "MAMBA SHADOW DIVERGENCE postprocess req_id=%s i=%d "
+                        "shadow=%d tensor=%d",
                         req_id,
                         i,
+                        shadow_idx,
                         src_block_idx,
-                        tensor_src,
                     )
-            else:
-                src_block_idx = tensor_src
             dest_block_idx = aligned_new_computed_tokens // mamba_spec.block_size - 1
             collect_mamba_copy_meta(
                 copy_bufs,
@@ -699,7 +697,6 @@ def preprocess_mamba(
     preempted_req_ids = scheduler_output.preempted_req_ids or set()
     resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
     shadow = input_batch.mamba_state_idx_shadow
-    use_shadow = envs.VLLM_DEBUG_MAMBA_ALIGN_REFERENCE and shadow is not None
     for req_id in itertools.chain(finished_req_ids, preempted_req_ids, resumed_req_ids):
         req_index = input_batch.req_id_to_index.get(req_id)
         if req_index is not None:
@@ -710,10 +707,18 @@ def preprocess_mamba(
     copy_bufs.offset = 0
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
-        if use_shadow:
-            prev_state_idx = shadow.get(req_id, -1)
-        else:
-            prev_state_idx = input_batch.mamba_state_idx_cpu[i]
+        prev_state_idx = int(input_batch.mamba_state_idx_cpu[i])
+        if shadow is not None:
+            shadow_prev = shadow.get(req_id, -1)
+            if shadow_prev != prev_state_idx:
+                logger.warning(
+                    "MAMBA SHADOW DIVERGENCE preprocess req_id=%s i=%d "
+                    "shadow=%d tensor=%d",
+                    req_id,
+                    i,
+                    shadow_prev,
+                    prev_state_idx,
+                )
         prev_state_idx_was_minus_one = prev_state_idx == -1
         if prev_state_idx == -1:
             # new / resumed request, no previous state
