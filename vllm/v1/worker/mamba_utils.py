@@ -148,14 +148,19 @@ def postprocess_mamba_fused_kernel(
         # actual data when the state tensor uses as_strided page padding.
         copy_size = state_inner_size * state_elem_size
 
-    # Match Python reference (collect_mamba_copy_meta): skip copy only when
-    # src and dest are the same logical block with no token bias.
+    # Mirror postprocess_mamba's trailing
+    #     if src_block_idx == dest_block_idx: num_accepted_tokens_cpu[i] = 1
+    # This runs whether or not the copy below is skipped (it's per-request, so
+    # only state_idx == 0 writes).
+    if src_block_idx == dest_block_idx and state_idx == 0:
+        tl.store(num_accepted_tokens_out_ptr + req_idx, 1)
+
+    # Mirror collect_mamba_copy_meta's early return: src==dst with no token
+    # bias means source and destination ranges coincide, so the copy is a
+    # no-op.
     if src_block_idx == dest_block_idx and accept_token_bias == 0:
-        if state_idx == 0:
-            tl.store(num_accepted_tokens_out_ptr + req_idx, 1)
         return
 
-    # Perform the memory copy
     offsets = tl.arange(0, COPY_BLOCK_SIZE)
     for i in range(0, copy_size, COPY_BLOCK_SIZE):
         mask = (i + offsets) < copy_size
@@ -163,13 +168,6 @@ def postprocess_mamba_fused_kernel(
         curr_dst = (dst_addr + i + offsets).to(tl.pointer_type(tl.uint8))
         data = tl.load(curr_src, mask=mask)
         tl.store(curr_dst, data, mask=mask)
-
-    # If src and dest block indices are the same (copy within same block),
-    # set num_accepted_tokens to 1. This matches the Python postprocess_mamba
-    # logic: "if src_block_idx == dest_block_idx: num_accepted_tokens_cpu[i] = 1"
-    # Only one thread (state_idx == 0) should perform this update.
-    if src_block_idx == dest_block_idx and state_idx == 0:
-        tl.store(num_accepted_tokens_out_ptr + req_idx, 1)
 
 
 @triton.jit
