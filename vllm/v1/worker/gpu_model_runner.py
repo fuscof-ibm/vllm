@@ -919,6 +919,13 @@ class GPUModelRunner(
 
     def post_kv_cache_wake_up(self) -> None:
         self.init_fp8_kv_scales()
+        # Mamba state tensors and the input_batch block-table tensors are
+        # allocated inside the CuMem "kv_cache" pool so their data_ptrs can
+        # be invalidated across a sleep/wake cycle. Invalidate the cached
+        # addresses so the next run_fused_postprocess re-captures them from
+        # the live tensors.
+        if self.mamba_gpu_postprocess_ctx is not None:
+            self.mamba_gpu_postprocess_ctx.is_initialized = False
 
     @torch.inference_mode()
     def init_fp8_kv_scales(self) -> None:
