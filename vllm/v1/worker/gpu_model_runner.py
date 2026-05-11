@@ -1516,22 +1516,19 @@ class GPUModelRunner(
                 )
 
             # Initialize metadata from forward_context if not done yet.
+            # Block-table base addresses / stride are captured once here too
+            # since input_batch.block_table.gpu is a persistent buffer.
             ctx = self.mamba_gpu_postprocess_ctx
             if not ctx.is_initialized:
                 ctx.initialize_from_forward_context(
                     self.kv_cache_config,
                     self.compilation_config.static_forward_context,
                     mamba_copy_funcs,
+                    [
+                        self.input_batch.block_table[gid].get_device_tensor(num_reqs)
+                        for gid in ctx.mamba_group_ids
+                    ],
                 )
-
-            # Stack block tables from all mamba groups. Each group has
-            # independently allocated physical blocks.
-            block_table_gpu = torch.stack(
-                [
-                    self.input_batch.block_table[gid].get_device_tensor(num_reqs)
-                    for gid in ctx.mamba_group_ids
-                ]
-            )  # [num_groups, num_reqs, max_blocks]
 
             # Run fused GPU postprocess.
             ctx.run_fused_postprocess(
@@ -1541,7 +1538,6 @@ class GPUModelRunner(
                 num_scheduled_tokens_gpu=self.num_scheduled_tokens_buf.gpu,
                 num_computed_tokens_gpu=self.num_computed_tokens_buf.gpu,
                 num_draft_tokens_gpu=self.num_draft_tokens_buf.gpu,
-                block_table_gpu=block_table_gpu,
             )
 
             # Copy from ctx.num_accepted_tokens_out which is pre-initialized
