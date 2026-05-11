@@ -30,9 +30,10 @@ def postprocess_mamba_fused_kernel(
     num_scheduled_tokens_ptr,
     num_computed_tokens_ptr,
     num_draft_tokens_ptr,
-    # Block table - shape [num_groups, max_reqs, max_blocks]
-    block_table_ptr,
-    block_table_stride_group: tl.int64,  # stride between groups (in elements)
+    # Per-group block table base addresses: int64[num_groups]. Each entry is
+    # the data_ptr of that group's persistent [max_reqs, max_blocks] int32
+    # block table.
+    block_table_ptrs_ptr,
     block_table_stride_req: tl.int64,  # stride between requests (in elements)
     # Mamba state metadata (per-layer, per-state-type)
     # These are 1D arrays indexed by (layer_idx * num_state_types + state_type_idx)
@@ -103,20 +104,15 @@ def postprocess_mamba_fused_kernel(
     # physical blocks.
     group_idx = tl.load(state_group_indices_ptr + state_idx).to(tl.int64)
 
-    # Load block IDs from block table. Cast to typed pointer BEFORE arithmetic
-    # to ensure element-wise (not byte-wise) pointer advancement.
-    # Promote loaded block ids to int64 *before* multiplying with the int64
-    # block stride. block_table stores int32 ids; state_block_stride can be
-    # tens of GB (base_addr + block_id * stride). Without the explicit cast
-    # Triton may evaluate `block_id * stride` as int32, silently truncating
-    # the product once block_id * stride exceeds 2**31 and producing a
-    # wrong src/dst address for large mamba caches.
-    block_table_typed = block_table_ptr.to(tl.pointer_type(tl.int32))
-    block_table_base = (
-        block_table_typed
-        + group_idx * block_table_stride_group
-        + req_idx * block_table_stride_req
-    )
+    # block_table_ptrs_ptr holds one pointer per group (each group owns its own
+    # block table). Reinterpret as int32* since block ids are int32.
+    group_base_addr = tl.load(block_table_ptrs_ptr + group_idx)
+    block_table_typed = group_base_addr.to(tl.pointer_type(tl.int32))
+    block_table_base = block_table_typed + req_idx * block_table_stride_req
+
+    # Widen block ids to int64 before they reach `block_id * state_block_stride`
+    # below: state_block_stride can exceed 2**31 bytes for large mamba caches,
+    # and Triton would otherwise do the multiply in int32 and wrap.
     src_block_id = tl.load(block_table_base + src_block_idx).to(tl.int64)
     dest_block_id = tl.load(block_table_base + dest_block_idx).to(tl.int64)
 
@@ -281,6 +277,12 @@ class MambaGPUContext:
     # Output buffer for num_accepted_tokens updates
     num_accepted_tokens_out: torch.Tensor
 
+    # Per-group block-table base addresses: int64[num_groups]. Populated in
+    # initialize_from_forward_context from the persistent per-group block
+    # table tensors (whose data_ptr is stable across steps).
+    block_table_ptrs: torch.Tensor
+    block_table_stride_req: int = 0
+
     # Flag to track if metadata has been populated
     is_initialized: bool = False
 
@@ -329,6 +331,9 @@ class MambaGPUContext:
             num_accepted_tokens_out=torch.zeros(
                 max_num_reqs, dtype=torch.int32, device=device
             ),
+            block_table_ptrs=torch.zeros(
+                len(mamba_group_ids), dtype=torch.int64, device=device
+            ),
             is_initialized=False,
         )
 
@@ -337,6 +342,7 @@ class MambaGPUContext:
         kv_cache_config: KVCacheConfig,
         forward_context: dict[str, Any],
         mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
+        block_tables: list[torch.Tensor],
     ) -> None:
         """
         Extract and cache memory layout metadata from Mamba state tensors.
@@ -377,6 +383,9 @@ class MambaGPUContext:
                 have a `kv_cache` attribute containing the list of state tensors.
             mamba_state_copy_funcs: Tuple of copy functions (one per state type)
                 used to determine whether each state is a conv or temporal state.
+            block_tables: per-mamba-group persistent block-table tensors, in
+                the same order as `mamba_group_ids`. Their `data_ptr()` /
+                `stride(0)` are captured once for the kernel to index into.
         """
         if self.is_initialized:
             return
@@ -437,6 +446,21 @@ class MambaGPUContext:
                     self.state_group_indices[idx] = group_local_idx
                     idx += 1
 
+        # Cache per-group block-table base addresses and per-request stride.
+        # `block_tables[i]` is the persistent 2D int32 block-table tensor for
+        # `mamba_group_ids[i]`; `data_ptr()` / `stride(0)` are stable for the
+        # engine's lifetime, so we capture them once here.
+        assert len(block_tables) == self.num_groups, (
+            f"expected {self.num_groups} block tables, got {len(block_tables)}"
+        )
+        strides = {bt.stride(0) for bt in block_tables}
+        assert len(strides) == 1, (
+            f"all mamba block tables must share stride(0), got {strides}"
+        )
+        self.block_table_stride_req = int(next(iter(strides)))
+        for i, bt in enumerate(block_tables):
+            self.block_table_ptrs[i] = bt.data_ptr()
+
         self.is_initialized = True
 
     def run_fused_postprocess(
@@ -447,7 +471,6 @@ class MambaGPUContext:
         num_scheduled_tokens_gpu: torch.Tensor,
         num_computed_tokens_gpu: torch.Tensor,
         num_draft_tokens_gpu: torch.Tensor,
-        block_table_gpu: torch.Tensor,
     ) -> None:
         """
         Run the fused postprocess_mamba kernel on GPU.
@@ -462,8 +485,6 @@ class MambaGPUContext:
             num_scheduled_tokens_gpu: [num_reqs] scheduled token counts
             num_computed_tokens_gpu: [num_reqs] computed token counts
             num_draft_tokens_gpu: [num_reqs] draft token counts
-            block_table_gpu: [num_groups, num_reqs, max_blocks] block IDs
-                per group per request
         """
         if num_reqs == 0 or not self.is_initialized:
             return
@@ -482,9 +503,8 @@ class MambaGPUContext:
             num_scheduled_tokens_gpu,
             num_computed_tokens_gpu,
             num_draft_tokens_gpu,
-            block_table_gpu,
-            block_table_gpu.stride(0),
-            block_table_gpu.stride(1),
+            self.block_table_ptrs,
+            self.block_table_stride_req,
             self.state_base_addrs,
             self.state_block_strides,
             self.state_elem_sizes,
