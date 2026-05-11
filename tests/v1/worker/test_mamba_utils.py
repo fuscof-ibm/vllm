@@ -1449,13 +1449,13 @@ class TestPostprocessMambaFusedKernel:
             num_state_types=2,
             device=device,
         )
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, forward_context_gpu, copy_funcs
-        )
-
         num_reqs = len(req_ids)
         block_table_gpu = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
         block_table_gpu[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
+
+        gpu_ctx.initialize_from_forward_context(
+            kv_cache_config, forward_context_gpu, copy_funcs, [block_table_gpu]
+        )
 
         gpu_ctx.run_fused_postprocess(
             num_reqs=num_reqs,
@@ -1478,7 +1478,6 @@ class TestPostprocessMambaFusedKernel:
                 dtype=torch.int32,
                 device=device,
             ),
-            block_table_gpu=block_table_gpu,
         )
         torch.accelerator.synchronize()
 
@@ -1644,10 +1643,6 @@ class TestPostprocessMambaFusedKernel:
             num_state_types=2,
             device=device,
         )
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, forward_context_gpu, copy_funcs
-        )
-
         num_reqs = len(req_ids)
         max_blocks = max(len(b) for b in block_ids_per_req)
         block_table_gpu = torch.zeros(
@@ -1657,6 +1652,10 @@ class TestPostprocessMambaFusedKernel:
             block_table_gpu[i, : len(block_ids)] = torch.tensor(
                 block_ids, dtype=torch.int32
             )
+
+        gpu_ctx.initialize_from_forward_context(
+            kv_cache_config, forward_context_gpu, copy_funcs, [block_table_gpu]
+        )
 
         gpu_ctx.run_fused_postprocess(
             num_reqs=num_reqs,
@@ -1679,7 +1678,6 @@ class TestPostprocessMambaFusedKernel:
                 dtype=torch.int32,
                 device=device,
             ),
-            block_table_gpu=block_table_gpu,
         )
         torch.accelerator.synchronize()
 
@@ -1838,10 +1836,6 @@ class TestPostprocessMambaFusedKernel:
             num_state_types=2,
             device=device,
         )
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, forward_context_gpu, copy_funcs
-        )
-
         num_reqs = len(req_ids)
         max_blocks = max(len(b) for b in block_ids_per_req)
         block_table_gpu = torch.zeros(
@@ -1851,6 +1845,10 @@ class TestPostprocessMambaFusedKernel:
             block_table_gpu[i, : len(block_ids)] = torch.tensor(
                 block_ids, dtype=torch.int32
             )
+
+        gpu_ctx.initialize_from_forward_context(
+            kv_cache_config, forward_context_gpu, copy_funcs, [block_table_gpu]
+        )
 
         gpu_ctx.run_fused_postprocess(
             num_reqs=num_reqs,
@@ -1873,7 +1871,6 @@ class TestPostprocessMambaFusedKernel:
                 dtype=torch.int32,
                 device=device,
             ),
-            block_table_gpu=block_table_gpu,
         )
         torch.accelerator.synchronize()
 
@@ -2023,13 +2020,13 @@ class TestPostprocessMambaFusedKernel:
             num_state_types=2,
             device=device,
         )
-        gpu_ctx.initialize_from_forward_context(
-            kv_cache_config, forward_context_gpu, copy_funcs
-        )
-
         num_reqs = len(req_ids)
         block_table_gpu = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
         block_table_gpu[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
+
+        gpu_ctx.initialize_from_forward_context(
+            kv_cache_config, forward_context_gpu, copy_funcs, [block_table_gpu]
+        )
 
         gpu_ctx.run_fused_postprocess(
             num_reqs=num_reqs,
@@ -2052,7 +2049,6 @@ class TestPostprocessMambaFusedKernel:
                 dtype=torch.int32,
                 device=device,
             ),
-            block_table_gpu=block_table_gpu,
         )
         torch.accelerator.synchronize()
 
@@ -2201,11 +2197,13 @@ class TestPostprocessMambaFusedKernel:
             num_state_types=2,
             device=device,
         )
-        gpu_ctx.initialize_from_forward_context(kv_cache_config, fwd_gpu, copy_funcs)
-
         num_reqs = 1
         block_table = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
         block_table[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
+
+        gpu_ctx.initialize_from_forward_context(
+            kv_cache_config, fwd_gpu, copy_funcs, [block_table]
+        )
 
         gpu_ctx.run_fused_postprocess(
             num_reqs=num_reqs,
@@ -2228,7 +2226,6 @@ class TestPostprocessMambaFusedKernel:
                 dtype=torch.int32,
                 device=device,
             ),
-            block_table_gpu=block_table,
         )
         torch.accelerator.synchronize()
 
@@ -2355,11 +2352,13 @@ class TestPostprocessMambaFusedKernel:
             num_state_types=2,
             device=device,
         )
-        gpu_ctx.initialize_from_forward_context(kv_cache_config, fwd_gpu, copy_funcs)
-
         num_reqs = 1
         block_table = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
         block_table[0, :8] = torch.tensor(block_ids_per_req[0], dtype=torch.int32)
+
+        gpu_ctx.initialize_from_forward_context(
+            kv_cache_config, fwd_gpu, copy_funcs, [block_table]
+        )
 
         gpu_ctx.run_fused_postprocess(
             num_reqs=num_reqs,
@@ -2382,7 +2381,6 @@ class TestPostprocessMambaFusedKernel:
                 dtype=torch.int32,
                 device=device,
             ),
-            block_table_gpu=block_table,
         )
         torch.accelerator.synchronize()
 
