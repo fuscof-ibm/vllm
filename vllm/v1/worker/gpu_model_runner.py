@@ -194,7 +194,11 @@ from vllm.v1.worker.cp_utils import (
 from vllm.v1.worker.dp_utils import coordinate_batch_across_dp
 from vllm.v1.worker.ec_connector_model_runner_mixin import ECConnectorModelRunnerMixin
 from vllm.v1.worker.gpu.pool.late_interaction_runner import LateInteractionRunner
-from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
+from vllm.v1.worker.gpu_input_batch import (
+    NO_PREV_MAMBA_STATE_ID,
+    CachedRequestState,
+    InputBatch,
+)
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
@@ -752,12 +756,11 @@ class GPUModelRunner(
         )
 
         # Mamba state index for hybrid models - tracks which block contains
-        # the running mamba state. -1 means "no previous state" (new/resumed
-        # request). Uses CpuGpuBuffer like num_accepted_tokens.
+        # the running mamba state. ``NO_PREV_MAMBA_STATE_ID`` means "no previous state"
+        # (new/resumed request). Uses CpuGpuBuffer like num_accepted_tokens.
         self.mamba_state_idx = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
-        # Initialize to -1 (sentinel for "no previous state")
-        self.mamba_state_idx.np.fill(-1)
-        self.mamba_state_idx.gpu.fill_(-1)
+        self.mamba_state_idx.np.fill(NO_PREV_MAMBA_STATE_ID)
+        self.mamba_state_idx.gpu.fill_(NO_PREV_MAMBA_STATE_ID)
 
         # Additional per-request metadata for GPU-side postprocess_mamba.
         # These enable a future GPU kernel to compute mamba state copy decisions
@@ -4149,6 +4152,7 @@ class GPUModelRunner(
                 self.num_accepted_tokens.copy_to_gpu(num_reqs)
 
                 # Sync mamba_state_idx to GPU (similar to num_accepted_tokens).
+                assert self.input_batch.mamba_state_idx_cpu is not None
                 self.mamba_state_idx.np[:num_reqs] = (
                     self.input_batch.mamba_state_idx_cpu[:num_reqs]
                 )
