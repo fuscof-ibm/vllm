@@ -29,6 +29,11 @@ from vllm.v1.sample.thinking_budget_state import (
 from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 
+# Sentinel for ``mamba_state_idx`` entries that have no previous running
+# mamba state (new or resumed request). The block index is then computed
+# from ``num_computed_tokens`` in the mamba preprocess path.
+NO_PREV_MAMBA_STATE_ID: int = -1
+
 
 @dataclass
 class CachedRequestState:
@@ -244,13 +249,13 @@ class InputBatch:
         self.num_accepted_tokens_cpu = self.num_accepted_tokens_cpu_tensor.numpy()
 
         # Mamba state index for hybrid models (tracks which block contains the
-        # running mamba state for each request). -1 means "no previous state"
-        # (new/resumed request, compute from num_computed_tokens).
-        # Only allocated for hybrid models.
+        # running mamba state for each request). ``NO_PREV_MAMBA_STATE_ID`` means "no
+        # previous state" (new/resumed request, compute from
+        # num_computed_tokens). Only allocated for hybrid models.
         if is_hybrid:
             self.mamba_state_idx_cpu_tensor: torch.Tensor | None = torch.full(
                 (max_num_reqs,),
-                fill_value=-1,
+                fill_value=NO_PREV_MAMBA_STATE_ID,
                 dtype=torch.int32,
                 device="cpu",
                 pin_memory=pin_memory,
@@ -486,9 +491,10 @@ class InputBatch:
         # Speculative decoding: by default 1 token is generated.
         self.num_accepted_tokens_cpu[req_index] = 1
 
-        # Mamba state: -1 means compute from num_computed_tokens (new request)
+        # Mamba state: NO_PREV_MAMBA_STATE_ID means compute from num_computed_tokens
+        # (new request).
         if self.mamba_state_idx_cpu is not None:
-            self.mamba_state_idx_cpu[req_index] = -1
+            self.mamba_state_idx_cpu[req_index] = NO_PREV_MAMBA_STATE_ID
 
         # Add request lora ID
         if request.lora_request:
@@ -554,7 +560,7 @@ class InputBatch:
 
         # Reset mamba state index
         if self.mamba_state_idx_cpu is not None:
-            self.mamba_state_idx_cpu[req_index] = -1
+            self.mamba_state_idx_cpu[req_index] = NO_PREV_MAMBA_STATE_ID
 
         # LoRA
         lora_id = self.request_lora_mapping[req_index]
@@ -824,7 +830,8 @@ class InputBatch:
                 self.mamba_state_idx_cpu[empty_index] = self.mamba_state_idx_cpu[
                     last_req_index
                 ]
-                self.mamba_state_idx_cpu[last_req_index] = -1  # Reset old slot
+                # Reset old slot
+                self.mamba_state_idx_cpu[last_req_index] = NO_PREV_MAMBA_STATE_ID
             generator = self.generators.pop(last_req_index, None)
             if generator is not None:
                 self.generators[empty_index] = generator

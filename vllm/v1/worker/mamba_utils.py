@@ -18,7 +18,7 @@ from vllm.utils.math_utils import cdiv
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.gpu_input_batch import CachedRequestState
+from vllm.v1.worker.gpu_input_batch import NO_PREV_MAMBA_STATE_ID, CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
 
 
@@ -581,8 +581,8 @@ def preprocess_mamba(
     (1 + num_speculative_blocks) block.
 
     Uses input_batch.mamba_state_idx_cpu[req_index] to track which block
-    contains the running mamba state for each request. -1 means "no previous
-    state" (new/resumed request, compute from num_computed_tokens).
+    contains the running mamba state for each request. ``NO_PREV_MAMBA_STATE_ID`` means
+    "no previous state" (new/resumed request, compute from num_computed_tokens).
     """
     assert input_batch.mamba_state_idx_cpu is not None, (
         "mamba_state_idx_cpu is None - preprocess_mamba should only be called "
@@ -608,15 +608,14 @@ def preprocess_mamba(
     for req_id in itertools.chain(finished_req_ids, preempted_req_ids, resumed_req_ids):
         req_index = input_batch.req_id_to_index.get(req_id)
         if req_index is not None:
-            input_batch.mamba_state_idx_cpu[req_index] = -1
+            input_batch.mamba_state_idx_cpu[req_index] = NO_PREV_MAMBA_STATE_ID
 
     copy_bufs.offset = 0
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
         prev_state_idx = input_batch.mamba_state_idx_cpu[i]
-        if prev_state_idx == -1:
+        if prev_state_idx == NO_PREV_MAMBA_STATE_ID:
             # new / resumed request, no previous state
-            # if num_computed_tokens is 0, prev_state_idx will be -1
             prev_state_idx = (req_state.num_computed_tokens - 1) // block_size
 
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
@@ -637,7 +636,10 @@ def preprocess_mamba(
         # And use block 1 to save the running state.
         curr_state_idx = num_blocks - 1 - num_speculative_blocks
         input_batch.mamba_state_idx_cpu[i] = curr_state_idx
-        if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
+        if (
+            prev_state_idx != NO_PREV_MAMBA_STATE_ID
+            and prev_state_idx != curr_state_idx
+        ):
             collect_mamba_copy_meta(
                 copy_bufs,
                 kv_cache_config,
