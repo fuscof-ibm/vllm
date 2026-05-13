@@ -614,8 +614,14 @@ def preprocess_mamba(
     for i, req_id in enumerate(input_batch.req_ids):
         req_state = requests[req_id]
         prev_state_idx = input_batch.mamba_state_idx_cpu[i]
-        if prev_state_idx == NO_PREV_MAMBA_STATE_ID:
-            # new / resumed request, no previous state
+        if (
+            prev_state_idx == NO_PREV_MAMBA_STATE_ID
+            and req_state.num_computed_tokens > 0
+        ):
+            # new / resumed request: derive the source block from the last
+            # fully-computed token. If num_computed_tokens == 0 there is no
+            # source state, so leave prev_state_idx as NO_PREV_MAMBA_STATE_ID
+            # and let the guard below skip the copy.
             prev_state_idx = (req_state.num_computed_tokens - 1) // block_size
 
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
