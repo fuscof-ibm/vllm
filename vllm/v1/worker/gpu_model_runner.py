@@ -1504,12 +1504,31 @@ class GPUModelRunner(
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
 
         if self.cache_config.mamba_cache_mode == "align":
-            # Fused GPU postprocess: state copies + per-request accepted-token
-            # update without CPU-GPU sync. The metadata
-            # (num_scheduled_tokens, num_draft_tokens, num_computed_tokens) is
-            # pre-staged to GPU buffers in _prepare_inputs.
+            # Orthogonal composition of PR #42574 and PR #40172:
+            #   PR #42574 controls WHEN postprocess runs (skip when provably
+            #             no-op — no request crosses a mamba block boundary).
+            #   PR #40172 controls WHERE postprocess runs (fused GPU kernel
+            #             when align mode and postprocess is needed).
+            mamba_bufs = self._get_mamba_bufs()
+            if mamba_utils.can_skip_mamba_postprocess(
+                scheduler_output,
+                self.input_batch,
+                self.requests,
+                mamba_bufs.preprocess.mamba_spec.block_size,
+                num_reqs,
+            ):
+                # PR #42574 fast-path: defer postprocess via non-blocking copy.
+                self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                    self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                )
+                assert self.num_accepted_tokens_event is not None
+                self.num_accepted_tokens_event.record()
+                return
+            # Fallthrough: postprocess required → PR #40172 fused GPU postprocess
+            # (no CPU-GPU sync; state copies + per-request accepted-token
+            # update all on GPU).
             mamba_utils.postprocess_mamba_align_gpu(
-                bufs=self._get_mamba_bufs(),
+                bufs=mamba_bufs,
                 num_reqs=num_reqs,
                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
                 num_accepted_tokens_cpu_tensor=(
