@@ -778,31 +778,65 @@ def _disable_triton_autotuner():
         return
     import importlib
 
-    Autotuner = importlib.import_module("triton.runtime.autotuner").Autotuner
+    autotuner_mod = importlib.import_module("triton.runtime.autotuner")
+    Autotuner = autotuner_mod.Autotuner
+    from triton.compiler.errors import CompileTimeAssertionFailure
+    from triton.runtime.errors import OutOfResources, PTXASError
+
+    _invalid_config_errors = (OutOfResources, CompileTimeAssertionFailure, PTXASError)
+    _picked_cache: dict[tuple, int] = {}
     seen_kernels: set[str] = set()
 
-    def _run_first_config(self, *args, **kwargs):
-        config = self.configs[0]
-        self.best_config = config
-        kernel_name = getattr(self.fn, "__name__", repr(self.fn))
-        if kernel_name not in seen_kernels:
-            seen_kernels.add(kernel_name)
-            logger.info(
-                "[triton-autotune-disabled] kernel=%s configs=%d picked=%s",
-                kernel_name,
-                len(self.configs),
-                config,
-            )
-        if config.pre_hook is not None:
-            full_nargs = {
-                **dict(zip(self.arg_names, args)),
-                **kwargs,
-                **config.all_kwargs(),
-            }
-            config.pre_hook(full_nargs)
-        return self.fn.run(*args, **kwargs, **config.all_kwargs())
+    def _run_first_valid_config(self, *args, **kwargs):
+        if not self.configs:
+            return self.fn(*args, **kwargs)
 
-    Autotuner.run = _run_first_config
+        key_vals = tuple(kwargs[name] for name in self.keys if name in kwargs)
+        cache_key = (id(self), key_vals)
+        kernel_name = getattr(self.base_fn, "__name__", repr(self.fn))
+
+        cached_idx = _picked_cache.get(cache_key)
+        candidate_indices = (
+            [cached_idx] if cached_idx is not None else list(range(len(self.configs)))
+        )
+
+        last_exc: Exception | None = None
+        for idx in candidate_indices:
+            config = self.configs[idx]
+            if config.pre_hook is not None:
+                full_nargs = {
+                    **dict(zip(self.arg_names, args)),
+                    **kwargs,
+                    **config.all_kwargs(),
+                }
+                config.pre_hook(full_nargs)
+            try:
+                result = self.fn(*args, **kwargs, **config.all_kwargs())
+            except _invalid_config_errors as e:
+                last_exc = e
+                continue
+
+            if cached_idx is None:
+                _picked_cache[cache_key] = idx
+                self.best_config = config
+                if kernel_name not in seen_kernels:
+                    seen_kernels.add(kernel_name)
+                    logger.info(
+                        "[triton-autotune-disabled] kernel=%s configs=%d "
+                        "picked_index=%d picked=%s",
+                        kernel_name,
+                        len(self.configs),
+                        idx,
+                        config,
+                    )
+            return result
+
+        raise RuntimeError(
+            f"VLLM_TRITON_FORCE_FIRST_CONFIG: no valid config for kernel "
+            f"{kernel_name} key={key_vals} (tried {len(self.configs)} configs)"
+        ) from last_exc
+
+    Autotuner.run = _run_first_valid_config
 
 
 _disable_triton_autotuner()
