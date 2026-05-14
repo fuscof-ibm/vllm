@@ -762,9 +762,8 @@ class GPUModelRunner(
         self.mamba_state_idx.np.fill(NO_PREV_MAMBA_STATE_ID)
         self.mamba_state_idx.gpu.fill_(NO_PREV_MAMBA_STATE_ID)
 
-        # Additional per-request metadata for GPU-side postprocess_mamba.
-        # These enable a future GPU kernel to compute mamba state copy decisions
-        # without CPU-GPU synchronization.
+        # Additional per-request metadata used to compute mamba state copy
+        # decisions on GPU without CPU-GPU synchronization.
         self.num_scheduled_tokens_buf = self._make_buffer(
             self.max_num_reqs, dtype=torch.int32
         )
