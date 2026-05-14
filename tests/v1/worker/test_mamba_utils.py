@@ -17,7 +17,7 @@ from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheGroupSpec, MambaSpec
 from vllm.v1.worker.mamba_utils import (
     MambaCopyBuffers,
-    MambaGPUContext,
+    MambaSpecDecodeGPUContext,
     collect_mamba_copy_meta,
     do_mamba_copy_block,
     preprocess_mamba,
@@ -397,7 +397,7 @@ class TestPostprocessMambaFusedKernel:
         torch.accelerator.synchronize()
 
         # --- Run GPU path ---
-        gpu_ctx = MambaGPUContext.create(
+        gpu_ctx = MambaSpecDecodeGPUContext.create(
             max_num_reqs=cfg.max_num_reqs,
             kv_cache_config=kv_cache_config,
             num_state_types=2,  # conv + temporal
@@ -510,7 +510,7 @@ class TestPostprocessMambaFusedKernel:
         forward_context = {"layer_0": _make_mock_attention(conv_state, temporal_state)}
         copy_funcs = (get_conv_copy_spec, get_temporal_copy_spec)
 
-        gpu_ctx = MambaGPUContext.create(
+        gpu_ctx = MambaSpecDecodeGPUContext.create(
             max_num_reqs=cfg.max_num_reqs,
             kv_cache_config=kv_cache_config,
             num_state_types=2,
@@ -623,7 +623,7 @@ class TestPostprocessMambaFusedKernel:
         torch.accelerator.synchronize()
 
         # Run GPU path
-        gpu_ctx = MambaGPUContext.create(
+        gpu_ctx = MambaSpecDecodeGPUContext.create(
             max_num_reqs=cfg.max_num_reqs,
             kv_cache_config=kv_cache_config,
             num_state_types=2,
@@ -761,7 +761,7 @@ class TestPostprocessMambaFusedKernel:
         torch.accelerator.synchronize()
 
         # Run GPU path with REALISTIC block table stride
-        gpu_ctx = MambaGPUContext.create(
+        gpu_ctx = MambaSpecDecodeGPUContext.create(
             max_num_reqs=cfg.max_num_reqs,
             kv_cache_config=kv_cache_config,
             num_state_types=2,
@@ -931,7 +931,7 @@ class TestPostprocessMambaFusedKernel:
         torch.accelerator.synchronize()
 
         # --- Run GPU path ---
-        gpu_ctx = MambaGPUContext.create(
+        gpu_ctx = MambaSpecDecodeGPUContext.create(
             max_num_reqs=cfg.max_num_reqs,
             kv_cache_config=kv_cache_config,
             num_state_types=2,
@@ -1104,7 +1104,7 @@ class TestPostprocessMambaFusedKernel:
         torch.accelerator.synchronize()
 
         # --- Run GPU path ---
-        gpu_ctx = MambaGPUContext.create(
+        gpu_ctx = MambaSpecDecodeGPUContext.create(
             max_num_reqs=cfg.max_num_reqs,
             kv_cache_config=kv_cache_config,
             num_state_types=2,
@@ -1280,7 +1280,7 @@ class TestPostprocessMambaFusedKernel:
         torch.accelerator.synchronize()
 
         # --- Run GPU path ---
-        gpu_ctx = MambaGPUContext.create(
+        gpu_ctx = MambaSpecDecodeGPUContext.create(
             max_num_reqs=cfg.max_num_reqs,
             kv_cache_config=kv_cache_config,
             num_state_types=2,
@@ -1443,7 +1443,7 @@ class TestPostprocessMambaFusedKernel:
         torch.accelerator.synchronize()
 
         # --- Run GPU path ---
-        gpu_ctx = MambaGPUContext.create(
+        gpu_ctx = MambaSpecDecodeGPUContext.create(
             max_num_reqs=cfg.max_num_reqs,
             kv_cache_config=kv_cache_config,
             num_state_types=2,
@@ -1637,7 +1637,7 @@ class TestPostprocessMambaFusedKernel:
         torch.accelerator.synchronize()
 
         # --- Run GPU path ---
-        gpu_ctx = MambaGPUContext.create(
+        gpu_ctx = MambaSpecDecodeGPUContext.create(
             max_num_reqs=local_cfg.max_num_reqs,
             kv_cache_config=kv_cache_config,
             num_state_types=2,
@@ -1830,7 +1830,7 @@ class TestPostprocessMambaFusedKernel:
         torch.accelerator.synchronize()
 
         # --- Run GPU path ---
-        gpu_ctx = MambaGPUContext.create(
+        gpu_ctx = MambaSpecDecodeGPUContext.create(
             max_num_reqs=local_cfg.max_num_reqs,
             kv_cache_config=kv_cache_config,
             num_state_types=2,
@@ -2014,7 +2014,7 @@ class TestPostprocessMambaFusedKernel:
         )
 
         # --- Run GPU path ---
-        gpu_ctx = MambaGPUContext.create(
+        gpu_ctx = MambaSpecDecodeGPUContext.create(
             max_num_reqs=cfg.max_num_reqs,
             kv_cache_config=kv_cache_config,
             num_state_types=2,
@@ -2191,7 +2191,7 @@ class TestPostprocessMambaFusedKernel:
         torch.accelerator.synchronize()
 
         # --- GPU fused kernel ---
-        gpu_ctx = MambaGPUContext.create(
+        gpu_ctx = MambaSpecDecodeGPUContext.create(
             max_num_reqs=cfg.max_num_reqs,
             kv_cache_config=kv_cache_config,
             num_state_types=2,
@@ -2346,7 +2346,7 @@ class TestPostprocessMambaFusedKernel:
         torch.accelerator.synchronize()
 
         # --- GPU fused kernel ---
-        gpu_ctx = MambaGPUContext.create(
+        gpu_ctx = MambaSpecDecodeGPUContext.create(
             max_num_reqs=cfg.max_num_reqs,
             kv_cache_config=kv_cache_config,
             num_state_types=2,

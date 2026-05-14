@@ -774,10 +774,6 @@ class GPUModelRunner(
             self.max_num_reqs, dtype=torch.int32
         )
 
-        # GPU postprocess context for mamba - created lazily after model load
-        # since we need to know num_state_types from the model.
-        self.mamba_gpu_postprocess_ctx: mamba_utils.MambaGPUContext | None = None
-
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
             # NOTE: `mrope_positions` is implemented with one additional dummy
@@ -910,7 +906,7 @@ class GPUModelRunner(
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
-        self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+        self._mamba_bufs: mamba_utils.MambaBuffers | None = None
         self.layerwise_nvtx_hooks_registered = False
 
     def update_max_model_len(self, max_model_len: int) -> None:
@@ -1010,15 +1006,23 @@ class GPUModelRunner(
             with_numpy=numpy,
         )
 
-    def _get_mamba_copy_bufs(self) -> mamba_utils.MambaCopyBuffers:
-        if self._mamba_copy_bufs is None:
-            self._mamba_copy_bufs = mamba_utils.MambaCopyBuffers.create(
-                self.max_num_reqs,
-                self.kv_cache_config,
-                self.model.get_mamba_state_copy_func(),
-                self._make_buffer,
+    def _get_mamba_bufs(self) -> mamba_utils.MambaBuffers:
+        # Only reachable on the ``mamba_cache_mode == "align"`` path.
+        # The postprocess sub-object is additionally gated on spec
+        # decode + hybrid model.
+        assert self.cache_config.mamba_cache_mode == "align"
+        if self._mamba_bufs is None:
+            self._mamba_bufs = mamba_utils.MambaBuffers.create(
+                max_num_reqs=self.max_num_reqs,
+                kv_cache_config=self.kv_cache_config,
+                copy_funcs=self.model.get_mamba_state_copy_func(),
+                make_buffer=self._make_buffer,
+                device=self.device,
+                with_postprocess=(
+                    self.speculative_config is not None and self.model_config.is_hybrid
+                ),
             )
-        return self._mamba_copy_bufs
+        return self._mamba_bufs
 
     def _init_model_kwargs(self):
         model_kwargs = dict[str, Any]()
@@ -1520,21 +1524,18 @@ class GPUModelRunner(
             # num_computed_tokens) is pre-synced to GPU buffers during
             # _prepare_inputs
 
-            # Lazily create the GPU postprocess context on first use.
-            mamba_copy_funcs = self.model.get_mamba_state_copy_func()
-            if self.mamba_gpu_postprocess_ctx is None:
-                self.mamba_gpu_postprocess_ctx = mamba_utils.MambaGPUContext.create(
-                    max_num_reqs=self.max_num_reqs,
-                    kv_cache_config=self.kv_cache_config,
-                    num_state_types=len(mamba_copy_funcs),
-                    device=self.device,
-                )
+            ctx = self._get_mamba_bufs().postprocess
+            # ``ctx`` is allocated whenever spec decode + hybrid hold; the
+            # outer ``_update_states_after_model_execute`` already early-returns
+            # otherwise, so this assert is just a tripwire if those gates
+            # ever drift apart.
+            assert ctx is not None
 
             # Initialize metadata from forward_context if not done yet.
             # Block-table base addresses / stride are captured once here too
             # since input_batch.block_table.gpu is a persistent buffer.
-            ctx = self.mamba_gpu_postprocess_ctx
             if not ctx.is_initialized:
+                mamba_copy_funcs = self.model.get_mamba_state_copy_func()
                 ctx.initialize_from_forward_context(
                     self.kv_cache_config,
                     self.compilation_config.static_forward_context,
@@ -4137,7 +4138,7 @@ class GPUModelRunner(
                     self.requests,
                     self.compilation_config.static_forward_context,
                     self.model.get_mamba_state_copy_func(),
-                    self._get_mamba_copy_bufs(),
+                    self._get_mamba_bufs().preprocess,
                 )
                 # preprocess_mamba resets num_accepted_tokens_cpu to 1
                 # for requests whose state was copied to a new block.
@@ -7143,7 +7144,7 @@ class GPUModelRunner(
         """
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
-        self._mamba_copy_bufs = None
+        self._mamba_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         self.initialize_attn_backend(kv_cache_config, is_profiling=is_profiling)
