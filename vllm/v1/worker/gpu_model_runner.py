@@ -1504,15 +1504,6 @@ class GPUModelRunner(
         the state are kept util we decide how many tokens are accepted for
         each sequence, and a shifting is done during the next iteration
         based on the number of accepted tokens.
-
-        Cache modes:
-        - "align" mode: Uses GPU-based postprocessing via a fused kernel to
-          handle mamba state copying without CPU-GPU synchronization. The
-          required metadata (num_scheduled_tokens, num_draft_tokens,
-          num_computed_tokens) is pre-synced to GPU buffers during
-          _prepare_inputs.
-        - non-"align" mode: Simply copies the accepted token counts to CPU
-          asynchronously for use in the next iteration's preprocessing.
         """
         if not self.speculative_config or not self.model_config.is_hybrid:
             return
@@ -1524,7 +1515,12 @@ class GPUModelRunner(
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
 
         if self.cache_config.mamba_cache_mode == "align":
-            # Use GPU-based postprocess to avoid CPU-GPU sync.
+            # Uses GPU-based postprocessing via a fused kernel to handle mamba
+            # state copying without CPU-GPU synchronization. The required
+            # metadata (num_scheduled_tokens, num_draft_tokens,
+            # num_computed_tokens) is pre-synced to GPU buffers during
+            # _prepare_inputs
+
             # Lazily create the GPU postprocess context on first use.
             mamba_copy_funcs = self.model.get_mamba_state_copy_func()
             if self.mamba_gpu_postprocess_ctx is None:
@@ -1568,6 +1564,8 @@ class GPUModelRunner(
                 ctx.num_accepted_tokens_out[:num_reqs], non_blocking=True
             )
         else:
+            # Simply copies the accepted token counts to CPU
+            # asynchronously for use in the next iteration's preprocessing.
             self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                 self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
             )
@@ -4151,16 +4149,17 @@ class GPUModelRunner(
                 )
                 self.num_accepted_tokens.copy_to_gpu(num_reqs)
 
-                # Sync mamba_state_idx to GPU (similar to num_accepted_tokens).
+                # Stage mamba_state_idx into the GPU buffer (non-blocking H→D copy)
                 assert self.input_batch.mamba_state_idx_cpu is not None
                 self.mamba_state_idx.np[:num_reqs] = (
                     self.input_batch.mamba_state_idx_cpu[:num_reqs]
                 )
                 self.mamba_state_idx.copy_to_gpu(num_reqs)
 
-                # Sync additional per-request metadata for GPU postprocess_mamba.
-                # These values don't change between _prepare_inputs and
-                # _update_states_after_model_execute, so syncing here is safe.
+                # Stage per-request postprocess metadata into GPU buffers
+                # (non-blocking). These values don't change between
+                # _prepare_inputs and _update_states_after_model_execute, so
+                # syncing here is safe.
                 scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
                 for i, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
                     req_state = self.requests[req_id]
