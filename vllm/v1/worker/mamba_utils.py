@@ -245,9 +245,13 @@ class MambaCopyBuffers:
 
 
 @dataclasses.dataclass
-class MambaGPUContext:
+class MambaSpecDecodeGPUContext:
     """
-    Context for GPU-side Mamba state copy operations.
+    Context for GPU-side Mamba state copy operations during the
+    fused postprocess path.
+
+    Only used when speculative decoding is enabled on a hybrid model
+    (and the mamba_cache_config is in align mode).
 
     Precomputes memory layout metadata (base addresses, strides, element sizes)
     so the GPU kernel can perform state copies without CPU-GPU sync.
@@ -291,7 +295,7 @@ class MambaGPUContext:
         kv_cache_config: KVCacheConfig,
         num_state_types: int,
         device: torch.device,
-    ) -> "MambaGPUContext":
+    ) -> "MambaSpecDecodeGPUContext":
         """Create context with allocated buffers (metadata populated later)."""
         mamba_group_ids, mamba_spec = get_mamba_groups(kv_cache_config)
 
@@ -513,6 +517,46 @@ class MambaGPUContext:
             num_reqs,
             block_size=self.block_size,
             COPY_BLOCK_SIZE=1024,
+        )
+
+
+@dataclasses.dataclass
+class MambaBuffers:
+    """Single owner for all mamba-specific runner buffers.
+
+    The two sub-objects have different gates:
+    ``preprocess`` is needed whenever ``mamba_cache_mode == "align"``;
+    ``postprocess`` is needed only when align is combined with
+    speculative decoding on a hybrid model, and is ``None`` otherwise.
+    """
+
+    preprocess: MambaCopyBuffers
+    postprocess: MambaSpecDecodeGPUContext | None
+
+    @classmethod
+    def create(
+        cls,
+        max_num_reqs: int,
+        kv_cache_config: KVCacheConfig,
+        copy_funcs: tuple[MambaStateCopyFunc, ...],
+        make_buffer: Callable[..., CpuGpuBuffer],
+        device: torch.device,
+        with_postprocess: bool,
+    ) -> "MambaBuffers":
+        return cls(
+            preprocess=MambaCopyBuffers.create(
+                max_num_reqs, kv_cache_config, copy_funcs, make_buffer
+            ),
+            postprocess=(
+                MambaSpecDecodeGPUContext.create(
+                    max_num_reqs=max_num_reqs,
+                    kv_cache_config=kv_cache_config,
+                    num_state_types=len(copy_funcs),
+                    device=device,
+                )
+                if with_postprocess
+                else None
+            ),
         )
 
 
