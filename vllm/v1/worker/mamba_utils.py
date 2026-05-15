@@ -799,3 +799,37 @@ def stage_mamba_state_idx_to_gpu(
         )
         np_view[i] = state_idx
     gpu_buf.copy_to_gpu(num_reqs)
+
+
+def stage_postprocess_inputs_to_gpu(
+    scheduler_output: SchedulerOutput,
+    req_ids: list[str],
+    num_reqs: int,
+    requests: dict[str, CachedRequestState],
+    mamba_state_idx: dict[str, int],
+    mamba_state_idx_buf: CpuGpuBuffer,
+    num_scheduled_tokens_buf: CpuGpuBuffer,
+    num_computed_tokens_buf: CpuGpuBuffer,
+    num_draft_tokens_buf: CpuGpuBuffer,
+) -> None:
+    """Stage all per-request inputs the fused mamba postprocess kernel reads.
+
+    Bundles ``stage_mamba_state_idx_to_gpu`` and
+    ``stage_postprocess_metadata_to_gpu`` into a single call so the runner
+    has one entry point for postprocess staging.
+    """
+    stage_mamba_state_idx_to_gpu(
+        mamba_state_idx,
+        req_ids,
+        num_reqs,
+        mamba_state_idx_buf,
+    )
+    stage_postprocess_metadata_to_gpu(
+        scheduler_output,
+        req_ids,
+        num_reqs,
+        requests,
+        num_scheduled_tokens_buf,
+        num_computed_tokens_buf,
+        num_draft_tokens_buf,
+    )
