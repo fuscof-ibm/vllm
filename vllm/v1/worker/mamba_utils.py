@@ -685,6 +685,39 @@ def preprocess_mamba(
     do_mamba_copy_block(copy_bufs)
 
 
+def stage_postprocess_metadata_to_gpu(
+    scheduler_output: SchedulerOutput,
+    req_ids: list[str],
+    num_reqs: int,
+    requests: dict[str, CachedRequestState],
+    num_scheduled_tokens_buf: CpuGpuBuffer,
+    num_computed_tokens_buf: CpuGpuBuffer,
+    num_draft_tokens_buf: CpuGpuBuffer,
+) -> None:
+    """Stage per-request postprocess metadata into GPU buffers (non-blocking).
+
+    Walks ``req_ids[:num_reqs]`` in batch order and writes each request's
+    scheduled/computed/draft token counts into the matching pinned numpy
+    views, then issues three non-blocking H→D copies. These values don't
+    change between ``_prepare_inputs`` and ``_update_states_after_model_execute``,
+    so staging here is safe. The fused postprocess kernel indexes the
+    resulting GPU tensors by ``req_idx``.
+    """
+    scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+    num_scheduled = scheduler_output.num_scheduled_tokens
+    scheduled_np = num_scheduled_tokens_buf.np
+    computed_np = num_computed_tokens_buf.np
+    draft_np = num_draft_tokens_buf.np
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        scheduled_np[i] = num_scheduled[req_id]
+        computed_np[i] = requests[req_id].num_computed_tokens
+        draft_np[i] = len(scheduled_spec_tokens.get(req_id, []))
+    num_scheduled_tokens_buf.copy_to_gpu(num_reqs)
+    num_computed_tokens_buf.copy_to_gpu(num_reqs)
+    num_draft_tokens_buf.copy_to_gpu(num_reqs)
+
+
 def stage_mamba_state_idx_to_gpu(
     mamba_state_idx: dict[str, int],
     req_ids: list[str],
