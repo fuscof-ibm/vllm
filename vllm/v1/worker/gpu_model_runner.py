@@ -1514,50 +1514,25 @@ class GPUModelRunner(
         self.num_accepted_tokens.gpu[:num_reqs] = (output_token_ids != -1).sum(dim=1)
 
         if self.cache_config.mamba_cache_mode == "align":
-            # Uses GPU-based postprocessing via a fused kernel to handle mamba
-            # state copying without CPU-GPU synchronization. The required
-            # metadata (num_scheduled_tokens, num_draft_tokens,
-            # num_computed_tokens) is pre-synced to GPU buffers during
-            # _prepare_inputs
-
-            ctx = self._get_mamba_bufs().postprocess
-            # ``ctx`` is allocated whenever spec decode + hybrid hold; the
-            # outer ``_update_states_after_model_execute`` already early-returns
-            # otherwise, so this assert is just a tripwire if those gates
-            # ever drift apart.
-            assert ctx is not None
-
-            # Initialize metadata from forward_context if not done yet.
-            # Block-table base addresses / stride are captured once here too
-            # since input_batch.block_table.gpu is a persistent buffer.
-            if not ctx.is_initialized:
-                mamba_copy_funcs = self.model.get_mamba_state_copy_func()
-                ctx.initialize_from_forward_context(
-                    self.kv_cache_config,
-                    self.compilation_config.static_forward_context,
-                    mamba_copy_funcs,
-                    [
-                        self.input_batch.block_table[gid].get_device_tensor(num_reqs)
-                        for gid in ctx.mamba_group_ids
-                    ],
-                )
-
-            # Run fused GPU postprocess.
-            ctx.run_fused_postprocess(
+            # Fused GPU postprocess: state copies + per-request accepted-token
+            # update without CPU-GPU sync. The metadata
+            # (num_scheduled_tokens, num_draft_tokens, num_computed_tokens) is
+            # pre-staged to GPU buffers in _prepare_inputs.
+            mamba_utils.postprocess_mamba_gpu(
+                bufs=self._get_mamba_bufs(),
                 num_reqs=num_reqs,
                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
                 mamba_state_idx_gpu=self.mamba_state_idx_buf.gpu,
                 num_scheduled_tokens_gpu=self.num_scheduled_tokens_buf.gpu,
                 num_computed_tokens_gpu=self.num_computed_tokens_buf.gpu,
                 num_draft_tokens_gpu=self.num_draft_tokens_buf.gpu,
-            )
-
-            # Copy from ctx.num_accepted_tokens_out which is pre-initialized
-            # from num_accepted_tokens_gpu. The kernel only overwrites values
-            # to 1 when src_block_idx == dest_block_idx (copy within same block);
-            # for all other requests, the original accepted token count is preserved.
-            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                ctx.num_accepted_tokens_out[:num_reqs], non_blocking=True
+                num_accepted_tokens_cpu_tensor=(
+                    self.input_batch.num_accepted_tokens_cpu_tensor
+                ),
+                input_batch=self.input_batch,
+                kv_cache_config=self.kv_cache_config,
+                forward_context=self.compilation_config.static_forward_context,
+                mamba_state_copy_funcs=self.model.get_mamba_state_copy_func(),
             )
         else:
             # Simply copies the accepted token counts to CPU

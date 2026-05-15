@@ -685,6 +685,62 @@ def preprocess_mamba(
     do_mamba_copy_block(copy_bufs)
 
 
+def postprocess_mamba_gpu(
+    *,
+    bufs: "MambaBuffers",
+    num_reqs: int,
+    num_accepted_tokens_gpu: torch.Tensor,
+    mamba_state_idx_gpu: torch.Tensor,
+    num_scheduled_tokens_gpu: torch.Tensor,
+    num_computed_tokens_gpu: torch.Tensor,
+    num_draft_tokens_gpu: torch.Tensor,
+    num_accepted_tokens_cpu_tensor: torch.Tensor,
+    input_batch: GPUInputBatch,
+    kv_cache_config: KVCacheConfig,
+    forward_context: dict[str, Any],
+    mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
+) -> None:
+    """GPU-side mamba postprocess for spec decode + hybrid + align mode.
+
+    Lazily binds the fused-kernel context to the persistent block tables and
+    forward-context state pointers on the first call, runs the fused kernel,
+    and async-copies the per-request accepted-token counts back to the input
+    batch's CPU tensor for the next iteration's preprocess.
+    """
+    ctx = bufs.postprocess
+    # Caller is responsible for gating on spec decode + hybrid; this assert is
+    # a tripwire if those gates ever drift apart.
+    assert ctx is not None
+
+    if not ctx.is_initialized:
+        ctx.initialize_from_forward_context(
+            kv_cache_config,
+            forward_context,
+            mamba_state_copy_funcs,
+            [
+                input_batch.block_table[gid].get_device_tensor(num_reqs)
+                for gid in ctx.mamba_group_ids
+            ],
+        )
+
+    ctx.run_fused_postprocess(
+        num_reqs=num_reqs,
+        num_accepted_tokens_gpu=num_accepted_tokens_gpu,
+        mamba_state_idx_gpu=mamba_state_idx_gpu,
+        num_scheduled_tokens_gpu=num_scheduled_tokens_gpu,
+        num_computed_tokens_gpu=num_computed_tokens_gpu,
+        num_draft_tokens_gpu=num_draft_tokens_gpu,
+    )
+
+    # ``num_accepted_tokens_out`` is pre-initialized from
+    # ``num_accepted_tokens_gpu``; the kernel only overwrites entries to 1
+    # when src_block_idx == dest_block_idx (copy within the same block), so
+    # the original count is preserved for everyone else.
+    num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+        ctx.num_accepted_tokens_out[:num_reqs], non_blocking=True
+    )
+
+
 def stage_postprocess_metadata_to_gpu(
     scheduler_output: SchedulerOutput,
     req_ids: list[str],
