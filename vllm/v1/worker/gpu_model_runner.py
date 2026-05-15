@@ -4121,19 +4121,15 @@ class GPUModelRunner(
                 )
                 self.num_accepted_tokens.copy_to_gpu(num_reqs)
 
-                # Stage mamba_state_idx into the GPU buffer (non-blocking H→D copy)
-                mamba_utils.stage_mamba_state_idx_to_gpu(
-                    self.mamba_state_idx,
-                    self.input_batch.req_ids,
-                    num_reqs,
-                    self.mamba_state_idx_buf,
-                )
-
-                mamba_utils.stage_postprocess_metadata_to_gpu(
+                # Stage all per-request inputs the fused postprocess kernel
+                # reads (mamba_state_idx + scheduled/computed/draft counts).
+                mamba_utils.stage_postprocess_inputs_to_gpu(
                     scheduler_output,
                     self.input_batch.req_ids,
                     num_reqs,
                     self.requests,
+                    self.mamba_state_idx,
+                    self.mamba_state_idx_buf,
                     self.num_scheduled_tokens_buf,
                     self.num_computed_tokens_buf,
                     self.num_draft_tokens_buf,
