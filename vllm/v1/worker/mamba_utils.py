@@ -371,15 +371,6 @@ class MambaSpecDecodeGPUContext:
         This method is idempotent - it only executes once (guarded by is_initialized
         flag) since the metadata is static after model loading.
 
-        Design note:
-            Triton kernels cannot accept PyTorch tensor objects directly. By
-            pre-computing pointer arithmetic parameters (base addresses, strides,
-            element sizes), the GPU kernel can calculate source/destination
-            addresses using simple arithmetic:
-                src_addr = base_addr + block_id * block_stride + offset
-            This avoids CPU involvement during inference and eliminates the
-            CPU-GPU synchronization that would otherwise be required.
-
         Args:
             kv_cache_config: Configuration containing KV cache group info and
                 layer name mappings.
