@@ -398,6 +398,7 @@ class TestPostprocessMambaFusedKernel:
             kv_cache_config=kv_cache_config,
             num_state_types=2,  # conv + temporal
             device=device,
+            make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
         )
 
         # Build GPU input tensors
@@ -511,6 +512,7 @@ class TestPostprocessMambaFusedKernel:
             kv_cache_config=kv_cache_config,
             num_state_types=2,
             device=device,
+            make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
         )
 
         num_reqs = len(req_ids)
@@ -624,6 +626,7 @@ class TestPostprocessMambaFusedKernel:
             kv_cache_config=kv_cache_config,
             num_state_types=2,
             device=device,
+            make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
         )
 
         max_blocks_per_req = 8
@@ -762,6 +765,7 @@ class TestPostprocessMambaFusedKernel:
             kv_cache_config=kv_cache_config,
             num_state_types=2,
             device=device,
+            make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
         )
 
         # KEY DIFFERENCE: Create a large block table like real code does
@@ -932,6 +936,7 @@ class TestPostprocessMambaFusedKernel:
             kv_cache_config=kv_cache_config,
             num_state_types=2,
             device=device,
+            make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
         )
 
         num_reqs = len(req_ids)
@@ -1105,6 +1110,7 @@ class TestPostprocessMambaFusedKernel:
             kv_cache_config=kv_cache_config,
             num_state_types=2,
             device=device,
+            make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
         )
 
         num_reqs = len(req_ids)
@@ -1281,6 +1287,7 @@ class TestPostprocessMambaFusedKernel:
             kv_cache_config=kv_cache_config,
             num_state_types=2,
             device=device,
+            make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
         )
 
         num_reqs = len(req_ids)
@@ -1444,6 +1451,7 @@ class TestPostprocessMambaFusedKernel:
             kv_cache_config=kv_cache_config,
             num_state_types=2,
             device=device,
+            make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
         )
         num_reqs = len(req_ids)
         block_table_gpu = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
@@ -1638,6 +1646,7 @@ class TestPostprocessMambaFusedKernel:
             kv_cache_config=kv_cache_config,
             num_state_types=2,
             device=device,
+            make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
         )
         num_reqs = len(req_ids)
         max_blocks = max(len(b) for b in block_ids_per_req)
@@ -1831,6 +1840,7 @@ class TestPostprocessMambaFusedKernel:
             kv_cache_config=kv_cache_config,
             num_state_types=2,
             device=device,
+            make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
         )
         num_reqs = len(req_ids)
         max_blocks = max(len(b) for b in block_ids_per_req)
@@ -2015,6 +2025,7 @@ class TestPostprocessMambaFusedKernel:
             kv_cache_config=kv_cache_config,
             num_state_types=2,
             device=device,
+            make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
         )
         num_reqs = len(req_ids)
         block_table_gpu = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
@@ -2192,6 +2203,7 @@ class TestPostprocessMambaFusedKernel:
             kv_cache_config=kv_cache_config,
             num_state_types=2,
             device=device,
+            make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
         )
         num_reqs = 1
         block_table = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
@@ -2347,6 +2359,7 @@ class TestPostprocessMambaFusedKernel:
             kv_cache_config=kv_cache_config,
             num_state_types=2,
             device=device,
+            make_buffer=lambda n, dtype: _MockCpuGpuBuffer(n, dtype, device),
         )
         num_reqs = 1
         block_table = torch.zeros(num_reqs, 8, dtype=torch.int32, device=device)
