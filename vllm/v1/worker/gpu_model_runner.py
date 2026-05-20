@@ -859,6 +859,12 @@ class GPUModelRunner(
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
         self.num_accepted_tokens_event: torch.Event | None = None
+        # Set in _prepare_inputs (align mode + spec decode), consumed in
+        # _update_states_after_model_execute. When True, the postprocess
+        # kernel is provably a no-op this step, so both the per-request
+        # staging copies in _prepare_inputs and the kernel launch itself
+        # are skipped, and num_accepted_tokens is copied to CPU async.
+        self._mamba_postprocess_skip: bool = False
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
             self.num_accepted_tokens_event = torch.Event()
@@ -1509,14 +1515,9 @@ class GPUModelRunner(
             #             no-op — no request crosses a mamba block boundary).
             #   PR #40172 controls WHERE postprocess runs (fused GPU kernel
             #             when align mode and postprocess is needed).
-            mamba_bufs = self._get_mamba_bufs()
-            if mamba_utils.can_skip_mamba_postprocess(
-                scheduler_output,
-                self.input_batch,
-                self.requests,
-                mamba_bufs.preprocess.mamba_spec.block_size,
-                num_reqs,
-            ):
+            # The skip decision was made in _prepare_inputs so the per-request
+            # staging copies could be skipped too; reuse it here.
+            if self._mamba_postprocess_skip:
                 # PR #42574 fast-path: defer postprocess via non-blocking copy.
                 self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                     self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
@@ -1528,7 +1529,7 @@ class GPUModelRunner(
             # (no CPU-GPU sync; state copies + per-request accepted-token
             # update all on GPU).
             mamba_utils.postprocess_mamba_align_gpu(
-                bufs=mamba_bufs,
+                bufs=self._get_mamba_bufs(),
                 num_reqs=num_reqs,
                 num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
                 num_accepted_tokens_cpu_tensor=(
@@ -4156,8 +4157,24 @@ class GPUModelRunner(
                 # only when that kernel will actually run. The kernel is
                 # gated on spec-decode + hybrid (see MambaBuffers.create);
                 # without it, ``mamba_bufs.postprocess_align`` is None and
-                # the staging buffers don't exist.
-                if mamba_bufs.postprocess_align is not None:
+                # the staging buffers don't exist. Additionally, when no
+                # request can cross a mamba block boundary this step the
+                # kernel is a provable no-op — skip the staging copies so
+                # the CPU stall the predicate frees isn't spent here.
+                self._mamba_postprocess_skip = (
+                    mamba_bufs.postprocess_align is not None
+                    and mamba_utils.can_skip_mamba_postprocess(
+                        scheduler_output,
+                        self.input_batch,
+                        self.requests,
+                        mamba_bufs.preprocess.mamba_spec.block_size,
+                        num_reqs,
+                    )
+                )
+                if (
+                    mamba_bufs.postprocess_align is not None
+                    and not self._mamba_postprocess_skip
+                ):
                     mamba_utils.stage_postprocess_inputs_to_gpu(
                         mamba_bufs.postprocess_align,
                         scheduler_output,
