@@ -655,6 +655,15 @@ class Platform:
         if cache_config.mamba_cache_mode == "align":
             cache_config.mamba_block_size = cache_config.block_size
 
+        logger.info(
+            "Resolved mamba_block_size=%d "
+            "(prefix_caching=%s, attn block_size=%d, mamba_cache_mode=%s)",
+            cache_config.mamba_block_size,
+            cache_config.enable_prefix_caching,
+            cache_config.block_size,
+            cache_config.mamba_cache_mode,
+        )
+
         # Pad mamba page size to exactly match attention page size
         attn_page_size = cache_config.block_size * attn_page_size_1_token
         assert attn_page_size >= mamba_page_size
