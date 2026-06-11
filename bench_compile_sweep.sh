@@ -36,18 +36,41 @@ CONCURRENCIES=(${CONCURRENCIES:-1 4 16})
 PYBIN=".venv/bin/python"
 [[ -x "$PYBIN" ]] || { echo "ERR: $PYBIN not found — activate uv venv first." >&2; exit 1; }
 
+ts() { date +"%H:%M:%S"; }
+log() { echo "[$(ts)] $*"; }
+banner() {
+    local msg="$*"
+    local bar
+    bar=$(printf '=%.0s' $(seq 1 ${#msg}))
+    echo
+    echo "[$(ts)] ${bar}=========="
+    echo "[$(ts)] ${msg}"
+    echo "[$(ts)] ${bar}=========="
+}
+
 wait_for_ready() {
-    local log="$1" deadline=$((SECONDS + 1800))
+    local log_file="$1" deadline=$((SECONDS + 1800)) start=$SECONDS waited=0 last_size=0
+    log "waiting for server /health on http://127.0.0.1:${PORT} (timeout 1800s)"
     while (( SECONDS < deadline )); do
         if curl -sf "http://127.0.0.1:${PORT}/health" >/dev/null 2>&1; then
+            log "server READY in $((SECONDS - start))s"
             return 0
         fi
         # Surface fatal errors fast.
-        if grep -qE "Traceback|RuntimeError|CUDA error" "$log" 2>/dev/null; then
-            echo "ERR: server failed to start, see $log" >&2
+        if grep -qE "Traceback|RuntimeError|CUDA error" "$log_file" 2>/dev/null; then
+            echo "ERR: server failed to start, see $log_file" >&2
+            tail -n 30 "$log_file" >&2 || true
             return 1
         fi
+        # Heartbeat every ~15s with a log size delta so silence is visible.
         sleep 5
+        waited=$((SECONDS - start))
+        if (( waited > 0 && waited % 15 == 0 )); then
+            local size; size=$(wc -c <"$log_file" 2>/dev/null || echo 0)
+            local delta=$((size - last_size))
+            log "  ...still booting (${waited}s elapsed, log +${delta} bytes)"
+            last_size=$size
+        fi
     done
     echo "ERR: server did not become ready within 1800s" >&2
     return 1
@@ -56,9 +79,14 @@ wait_for_ready() {
 start_server() {
     local cfg="$1"; shift
     local logfile="${LOGDIR}/server_${cfg}.log"
-    echo "=== starting server: cfg=${cfg} ==="
+    banner "starting server: cfg=${cfg}"
+    log "model=${MODEL}  gpu=${GPU}  port=${PORT}"
+    log "extra args: $*"
+    log "server log -> ${logfile}"
     # Kill any straggler on this port first.
-    fuser -k "${PORT}/tcp" 2>/dev/null || true
+    if fuser -k "${PORT}/tcp" 2>/dev/null; then
+        log "  killed prior process on port ${PORT}"
+    fi
     sleep 2
     CUDA_VISIBLE_DEVICES="$GPU" \
     VLLM_LOGGING_LEVEL=DEBUG \
@@ -68,6 +96,7 @@ start_server() {
             "$@" \
             >"$logfile" 2>&1 &
     SERVER_PID=$!
+    log "server pid=${SERVER_PID}"
     if ! wait_for_ready "$logfile"; then
         kill -9 "$SERVER_PID" 2>/dev/null || true
         return 1
@@ -76,12 +105,17 @@ start_server() {
 
 stop_server() {
     [[ -n "${SERVER_PID:-}" ]] || return 0
+    log "stopping server pid=${SERVER_PID}"
     kill -INT "$SERVER_PID" 2>/dev/null || true
     for _ in {1..30}; do
         kill -0 "$SERVER_PID" 2>/dev/null || break
         sleep 1
     done
-    kill -9 "$SERVER_PID" 2>/dev/null || true
+    if kill -0 "$SERVER_PID" 2>/dev/null; then
+        log "  force-killing server (SIGINT timed out)"
+        kill -9 "$SERVER_PID" 2>/dev/null || true
+    fi
+    log "server stopped"
     SERVER_PID=""
 }
 trap stop_server EXIT
@@ -90,16 +124,22 @@ run_client_sweep() {
     local cfg="$1"
     local outdir="${OUTROOT}/${cfg}"
     mkdir -p "$outdir"
-    # Discard a warmup at low concurrency.
+    banner "benchmarking: cfg=${cfg}  concurrencies=[${CONCURRENCIES[*]}]"
+    log "results dir -> ${outdir}"
+
+    log "client warmup (32 prompts, c=4) — discarded"
+    local warmup_start=$SECONDS
     "$PYBIN" -m vllm.entrypoints.cli.main bench serve \
         --model "$MODEL" --base-url "http://127.0.0.1:${PORT}" \
         --dataset-name random --random-input-len "$INPUT_LEN" \
         --random-output-len "$OUTPUT_LEN" --num-prompts 32 \
         --max-concurrency 4 --request-rate inf --ignore-eos \
-        >/dev/null 2>&1 || true
+        >"${outdir}/warmup.log" 2>&1 || true
+    log "warmup done in $((SECONDS - warmup_start))s"
 
     for c in "${CONCURRENCIES[@]}"; do
-        echo "--- bench cfg=${cfg} concurrency=${c} ---"
+        log "----- bench cfg=${cfg} concurrency=${c} (in=${INPUT_LEN} out=${OUTPUT_LEN} n=${NUM_PROMPTS}) -----"
+        local run_start=$SECONDS
         "$PYBIN" -m vllm.entrypoints.cli.main bench serve \
             --model "$MODEL" \
             --base-url "http://127.0.0.1:${PORT}" \
@@ -114,14 +154,18 @@ run_client_sweep() {
             --save-result --result-dir "$outdir" \
             --result-filename "c${c}.json" \
             --label "${cfg}-c${c}"
+        log "concurrency=${c} done in $((SECONDS - run_start))s -> ${outdir}/c${c}.json"
     done
+    log "sweep cfg=${cfg} complete"
 }
 
 run_cfg() {
     local cfg="$1"; shift
+    local cfg_start=$SECONDS
     start_server "$cfg" "$@"
     run_client_sweep "$cfg"
     stop_server
+    log "cfg=${cfg} total wall time: $((SECONDS - cfg_start))s"
 }
 
 # 1) Eager: no compile, no CUDA graphs.
