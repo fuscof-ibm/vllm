@@ -2,12 +2,15 @@
 # Sweep torch.compile contribution on Granite 4.
 #
 # Runs three server configs, each with a client-side concurrency sweep:
-#   eager      : --enforce-eager           (no compile, no CUDA graphs)
-#   nocompile  : -O.mode=0                 (no compile, CUDA graphs ON)
-#   full       : default (mode=3)          (compile + piecewise CUDA graphs)
+#   eager      : -O0                                     (no compile, no graphs)
+#   nocompile  : -cc '{"mode":0,"cudagraph_mode":"FULL"}' (no compile, FULL graphs)
+#   full       : -O2 (default)                           (compile + FULL_AND_PIECEWISE)
 #
 # `full` vs `nocompile` isolates the torch.compile contribution.
 # `nocompile` vs `eager`  isolates the CUDA-graph contribution.
+#
+# Note: -O on this branch is --optimization-level (integer preset 0/1/2/3),
+# NOT the dotted-key syntax used by some other torch.compile front-ends.
 #
 # Server logs are captured under bench_results/<model_tag>/logs/, and the
 # `full` run also writes an FX/pass debug dump for parse_compile_dump.py.
@@ -169,14 +172,16 @@ run_cfg() {
 }
 
 # 1) Eager: no compile, no CUDA graphs.
-run_cfg eager --enforce-eager
+run_cfg eager -O0
 
-# 2) No compile, CUDA graphs on.
-run_cfg nocompile -O.mode=0
+# 2) No compile, CUDA graphs on (FULL graphs work without compile;
+#    PIECEWISE would require mode=VLLM_COMPILE).
+run_cfg nocompile -cc '{"mode":0,"cudagraph_mode":"FULL"}'
 
-# 3) Full compile (default mode=3) with FX/pass dump enabled.
-run_cfg full -O.debug_dump_path="${DUMPDIR}" \
-             -O.compile_cache_save_format=unpacked
+# 3) Full compile (default O2) with FX/pass dump enabled. The dump path and
+#    cache format have to be passed via -cc on this branch.
+FULL_CC=$(printf '{"debug_dump_path":"%s","compile_cache_save_format":"unpacked"}' "$DUMPDIR")
+run_cfg full -cc "$FULL_CC"
 
 echo
 echo "Done. Results: $OUTROOT"
