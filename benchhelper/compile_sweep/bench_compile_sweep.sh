@@ -101,10 +101,13 @@ start_server() {
         log "  killed prior process on port ${PORT}"
     fi
     sleep 2
+    # `vllm serve <model>` via the CLI module so we don't depend on
+    # .venv/bin/vllm being on PATH. Equivalent to:
+    #   .venv/bin/vllm serve "$MODEL" --port "$PORT" "$@"
     CUDA_VISIBLE_DEVICES="$GPU" \
     VLLM_LOGGING_LEVEL=DEBUG \
-        "$PYBIN" -m vllm.entrypoints.openai.api_server \
-            --model "$MODEL" \
+        "$PYBIN" -m vllm.entrypoints.cli.main serve \
+            "$MODEL" \
             --port "$PORT" \
             "$@" \
             >"$logfile" 2>&1 &
