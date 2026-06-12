@@ -46,6 +46,16 @@ RE_PC_FLAG = re.compile(r"'(fuse_\w+|enable_\w+)':\s*(True|False)")
 # Extract splitting_ops list (helps explain partition counts).
 RE_SPLITTING_OPS = re.compile(r"'splitting_ops':\s*\[([^\]]*)\]")
 
+# Used by the output_code.py scanner. We walk the body of `def call(args):`
+# and classify each line as a Triton-kernel call or a vLLM custom-op call;
+# triton↔custom_op↔triton adjacencies are the highest-signal manual-fusion
+# candidates (Inductor split the work because it cannot see across the op).
+RE_CALL_DEF = re.compile(r"^def call\(")
+RE_TRITON_CALL = re.compile(r"^\s*(triton_\w+)\.run\(")
+# Match torch.ops.<ns>.<op>[.default](...)  but skip torch.ops.aten.* — aten
+# externs (matmul, conv) are barriers too but not the candidates we own.
+RE_CUSTOM_OP = re.compile(r"^\s*(?:\w+\s*=\s*)?torch\.ops\.((?!aten\.)[\w.]+)\(")
+
 
 # Knowledge base for the optimization-hint section.
 # Each entry: pass class name -> dict with:
@@ -215,10 +225,11 @@ def emit_hints(
             f"{', '.join(splitting_ops[:6])}" + (" …" if len(splitting_ops) > 6 else "")
         )
 
+    # Diagnose the no-match case (but DO NOT early-return — the unseen-passes
+    # catalog below is what tells the user what they could pursue).
     if not table:
         print()
         print("  no fusion-pass matches were recorded.")
-        # Try to explain why.
         defaults_only = pass_config_seen and not pass_config
         all_off = pass_config and not any(pass_config.values())
         if defaults_only or all_off:
@@ -243,7 +254,6 @@ def emit_hints(
             print("  → some gates are on but no patterns matched. The model may")
             print("    not contain the patterns those passes look for; inspect")
             print("    the per-pass pattern files listed in PASS_INFO.")
-        # Even with no matches, the IR cleanup passes ran — point at them.
         print()
         print("  what compile DID do on this run (from per-pass timing):")
         print("    Inductor codegen + CUDA-graph capture only. The compile vs.")
@@ -252,36 +262,40 @@ def emit_hints(
         print("    any of the cataloged fusion passes. Manual optimization for")
         print("    this model should target Mamba/SSM kernels and the existing")
         print("    custom ops, not the FX-pass catalog.")
-        return
 
-    # Annotate every observed pass with priority + info; sort high to low.
-    annotated = []
-    for name, n in table.items():
-        info = PASS_INFO.get(name, {})
-        prio, sort_key = hint_priority(name, n)
-        annotated.append((sort_key, prio, name, n, info))
-    annotated.sort(key=lambda x: -x[0])
+    # Per-pass annotation: observed passes first (sorted by leverage), then
+    # the catalog of passes that did NOT fire with the reason why.
+    if table:
+        annotated = []
+        for name, n in table.items():
+            info = PASS_INFO.get(name, {})
+            prio, sort_key = hint_priority(name, n)
+            annotated.append((sort_key, prio, name, n, info))
+        annotated.sort(key=lambda x: -x[0])
+        for _, prio, name, n, info in annotated:
+            print(f"\n  [{prio}]  {name}  matches={n}")
+            if info:
+                if what := info.get("what"):
+                    print(f"    what    : {what}")
+                if manual := info.get("manual"):
+                    print(f"    manual  : {manual}")
+                if pattern := info.get("pattern"):
+                    print(f"    pattern : {pattern}")
+                if gate := info.get("gate"):
+                    print(f"    gate    : {gate}")
+            else:
+                print("    (no entry in PASS_INFO — add one to extend hints)")
 
-    for _, prio, name, n, info in annotated:
-        print(f"\n  [{prio}]  {name}  matches={n}")
-        if info:
-            if what := info.get("what"):
-                print(f"    what    : {what}")
-            if manual := info.get("manual"):
-                print(f"    manual  : {manual}")
-            if pattern := info.get("pattern"):
-                print(f"    pattern : {pattern}")
-            if gate := info.get("gate"):
-                print(f"    gate    : {gate}")
-        else:
-            print("    (no entry in PASS_INFO — add one to extend hints)")
-
-    # Footer: which entries in PASS_INFO did not appear, with explanation
-    # using the pass_config we parsed from the log when possible.
+    # Always emit the catalog of cataloged passes the user could pursue.
     unseen = sorted(set(PASS_INFO) - set(table))
     if unseen:
         print()
-        print("  passes that did NOT fire on this run:")
+        header = (
+            "  passes that did NOT fire on this run:"
+            if table
+            else "  cataloged fusion passes (none fired) — what each would do:"
+        )
+        print(header)
         for name in unseen:
             info = PASS_INFO[name]
             flag = info.get("flag")
@@ -292,9 +306,19 @@ def emit_hints(
                     if pass_config[flag]
                     else "fusion disabled in this run"
                 )
+            elif flag:
+                # gate name known but no log evidence — show the flag name.
+                reason = f"pass_config.{flag} (default OFF)"
             else:
-                reason = f"gate: {info.get('gate', '?')}"
-            print(f"    - {name:36s} {reason}")
+                reason = info.get("gate", "?")
+            what = info.get("what", "?")
+            manual = info.get("manual", "")
+            print(f"    - {name}")
+            print(f"        what   : {what}")
+            print(f"        gate   : {reason}")
+            if manual:
+                print(f"        manual : {manual}")
+        print()
         print("    → 0-match passes whose gate is ON are the highest-leverage")
         print("      'missed opportunity' candidates. 0-match with gate OFF")
         print("      means you'd need to change the run config (quant, TP,")
@@ -365,6 +389,58 @@ def scan_dump(path: Path) -> dict:
         "patterns_files": dict(pattern_files),
         "fx_files": fx_files,
         "output_code_files": output_code,
+    }
+
+
+def _scan_output_code(path: Path) -> list[tuple[str, str, str]]:
+    """Find triton↔custom_op↔triton triples in one output_code.py.
+
+    Each triple is a manual-fusion candidate: Inductor emitted two Triton
+    kernels around a vLLM custom op it could not fuse across — same shape
+    as PR #43355's RoPE+reshape_and_cache pattern.
+    """
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return []
+    in_call = False
+    seq: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        if not in_call:
+            if RE_CALL_DEF.match(line):
+                in_call = True
+            continue
+        # Dedent back to column 0 → end of call() body.
+        if line and not line.startswith((" ", "\t")):
+            break
+        if m := RE_TRITON_CALL.match(line):
+            seq.append(("triton", m.group(1)))
+        elif m := RE_CUSTOM_OP.match(line):
+            op = m.group(1).removesuffix(".default")
+            seq.append(("custom_op", op))
+    triples: list[tuple[str, str, str]] = []
+    for i in range(len(seq) - 2):
+        a, b, c = seq[i], seq[i + 1], seq[i + 2]
+        if a[0] == "triton" and b[0] == "custom_op" and c[0] == "triton":
+            triples.append((a[1], b[1], c[1]))
+    return triples
+
+
+def scan_output_codes(dump_dir: Path) -> dict:
+    """Aggregate fusion-miss triples across every output_code*.py."""
+    if not dump_dir.exists():
+        return {"files": 0, "triples": [], "barrier_counts": {}}
+    files = list(dump_dir.rglob("output_code*.py"))
+    all_triples: list[tuple[str, str, str]] = []
+    barrier_counts: dict[str, int] = defaultdict(int)
+    for f in files:
+        for triple in _scan_output_code(f):
+            all_triples.append(triple)
+            barrier_counts[triple[1]] += 1
+    return {
+        "files": len(files),
+        "triples": all_triples,
+        "barrier_counts": dict(barrier_counts),
     }
 
 
@@ -466,6 +542,42 @@ def main(argv: list[str]) -> int:
         rows = sorted(dump["patterns_files"].items(), key=lambda r: -r[1])
         print("  pattern dumps per pass:")
         print(fmt_table(rows, ("pass", "files")))
+
+    oc = scan_output_codes(dump_path)
+    if oc["files"]:
+        print()
+        print("=== Inductor output_code.py: kernel↔op↔kernel fusion misses")
+        print(f"  scanned {oc['files']} output_code*.py file(s)")
+        if oc["barrier_counts"]:
+            print()
+            print(
+                "  custom-op barriers between Triton kernels "
+                "(manual-fusion candidates):"
+            )
+            rows = sorted(
+                ((op, n) for op, n in oc["barrier_counts"].items()),
+                key=lambda r: -r[1],
+            )
+            print(fmt_table(rows, ("barrier_op", "kernel_pairs")))
+            triple_counts: dict[tuple[str, str, str], int] = defaultdict(int)
+            for t in oc["triples"]:
+                triple_counts[t] += 1
+            top = sorted(triple_counts.items(), key=lambda r: -r[1])[:8]
+            print()
+            print("  top kernel→op→kernel triples (by occurrence):")
+
+            def _short(s: str) -> str:
+                return s if len(s) <= 40 else s[:37] + "..."
+
+            for (a, op, b), n in top:
+                print(f"    [{n:3}]  {_short(a)} → {op} → {_short(b)}")
+            print()
+            print("  → each triple is a place Inductor produced two Triton")
+            print("    kernels around a vLLM custom op. Manual fusion follows")
+            print("    PR #43355: write csrc kernel, bind torch.ops.vllm.<op>,")
+            print("    rewire model call site, drop the FX pass.")
+        else:
+            print("  (no triton↔custom_op↔triton triples found in call() bodies)")
     return 0
 
 
