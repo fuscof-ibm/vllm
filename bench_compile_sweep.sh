@@ -19,11 +19,21 @@
 #   ./bench_compile_sweep.sh                       # defaults below
 #   MODEL=ibm-granite/granite-4.0-h-small \
 #   PORT=8000 GPU=0 ./bench_compile_sweep.sh
+#   GPU="0,1" TP=2 ./bench_compile_sweep.sh        # 2-way tensor parallel
+#   MODEL=Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
+#   GPU="0,1,2,3" TP=4 ./bench_compile_sweep.sh    # different model, 4-way TP
+#   CONCURRENCIES="1 8 32 64" ./bench_compile_sweep.sh   # custom client load
+#   INPUT_LEN=512 OUTPUT_LEN=1024 NUM_PROMPTS=400 \
+#   CONCURRENCIES="1 16" ./bench_compile_sweep.sh         # heavier workload
 set -euo pipefail
 
 MODEL="${MODEL:-ibm-granite/granite-4.0-h-small}"
 PORT="${PORT:-8000}"
 GPU="${GPU:-0}"
+# Tensor-parallel size. Must match the number of GPUs in $GPU
+# (e.g. GPU="0,1" TP=2). TP>1 also unlocks the AllReduceFusion /
+# SequenceParallelism gates in pass_config.
+TP="${TP:-1}"
 MODEL_TAG="${MODEL_TAG:-$(basename "$MODEL")}"
 OUTROOT="./bench_results/compile_sweep/${MODEL_TAG}"
 LOGDIR="${OUTROOT}/logs"
@@ -83,7 +93,7 @@ start_server() {
     local cfg="$1"; shift
     local logfile="${LOGDIR}/server_${cfg}.log"
     banner "starting server: cfg=${cfg}"
-    log "model=${MODEL}  gpu=${GPU}  port=${PORT}"
+    log "model=${MODEL}  gpu=${GPU}  tp=${TP}  port=${PORT}"
     log "extra args: $*"
     log "server log -> ${logfile}"
     # Kill any straggler on this port first.
@@ -172,16 +182,16 @@ run_cfg() {
 }
 
 # 1) Eager: no compile, no CUDA graphs.
-run_cfg eager -O0
+run_cfg eager -tp "$TP" -O0
 
 # 2) No compile, CUDA graphs on (FULL graphs work without compile;
 #    PIECEWISE would require mode=VLLM_COMPILE).
-run_cfg nocompile -cc '{"mode":0,"cudagraph_mode":"FULL"}'
+run_cfg nocompile -tp "$TP" -cc '{"mode":0,"cudagraph_mode":"FULL"}'
 
 # 3) Full compile (default O2) with FX/pass dump enabled. The dump path and
 #    cache format have to be passed via -cc on this branch.
 FULL_CC=$(printf '{"debug_dump_path":"%s","compile_cache_save_format":"unpacked"}' "$DUMPDIR")
-run_cfg full -cc "$FULL_CC"
+run_cfg full -tp "$TP" -cc "$FULL_CC"
 
 echo
 echo "Done. Results: $OUTROOT"
