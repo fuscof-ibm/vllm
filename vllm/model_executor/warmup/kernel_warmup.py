@@ -7,6 +7,7 @@ happen during model execution.
 """
 
 import hashlib
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -71,7 +72,17 @@ def kernel_warmup(worker: "Worker"):
     if enable_flashinfer_autotune is False:
         logger.info("Skipping FlashInfer autotune because it is disabled.")
     elif has_flashinfer() and current_platform.has_device_capability(90):
+        logger.info(
+            "Starting FlashInfer autotune. This may JIT-compile cutlass "
+            "kernels via nvcc on first run and can take several minutes; "
+            "subsequent runs reuse the on-disk cache."
+        )
+        autotune_start = time.perf_counter()
         flashinfer_autotune(worker.model_runner)
+        logger.info(
+            "FlashInfer autotune finished in %.2f s",
+            time.perf_counter() - autotune_start,
+        )
 
     # FlashInfer attention warmup
     # Only warmup if the model has FlashInfer attention groups
@@ -94,7 +105,11 @@ def kernel_warmup(worker: "Worker"):
             for group in groups
         )
     ):
-        logger.info("Warming up FlashInfer attention.")
+        logger.info(
+            "Warming up FlashInfer attention. This may JIT-compile attention "
+            "kernels on first run."
+        )
+        attn_warmup_start = time.perf_counter()
         # Warmup with mixed batch containing both prefill and decode tokens
         # This is to warm up both prefill and decode attention kernels
         worker.model_runner._dummy_run(
@@ -103,6 +118,10 @@ def kernel_warmup(worker: "Worker"):
             is_profile=True,
             force_attention=True,
             create_mixed_batch=True,
+        )
+        logger.info(
+            "FlashInfer attention warmup finished in %.2f s",
+            time.perf_counter() - attn_warmup_start,
         )
 
 
