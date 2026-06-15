@@ -69,3 +69,23 @@ Current summarizer is 2-way. Run it twice for the 3-way comparison:
 # Kernel gain at APC-on:
 ./bench_summarize.py bench_results/main-apc-on bench_results/pr40172-apc-on
 ```
+
+### Custom column labels
+
+By default the table columns are headed `main` / `PR`. Override them with the
+optional `--labels` flag, which takes a **colon-separated** pair where the
+first half labels the baseline (first dir) and the second half labels the
+comparison (second dir):
+
+```bash
+./bench_summarize.py \
+  bench_results/main-apc-off \
+  bench_results/main-apc-on \
+  --labels "c68c55d4 APC=off:c68c55d4 APC=on"
+```
+
+The flag is optional — omitting it keeps the `main` / `PR` defaults. The
+column width auto-expands to fit longer labels.
+
+> Caveat: `:` is the separator, so labels themselves cannot contain a colon
+> (no URLs, no `HH:MM` timestamps).

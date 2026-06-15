@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Summarize bench_sweep.sh results. Tabulates main vs PR across concurrencies.
+"""Summarize bench_sweep.sh results. Tabulates baseline vs comparison across
+concurrencies.
 
 Usage:
     ./bench_summarize.py bench_results/main bench_results/pr40172
+    ./bench_summarize.py base/ comp/ --labels "APC=off:APC=on"
 """
 
+import argparse
 import json
 import statistics
-import sys
 from pathlib import Path
 
 METRICS = [
@@ -44,15 +46,21 @@ def fmt(v: float, prec: int) -> str:
     return "nan" if v != v else f"{v:.{prec}f}"
 
 
-def main(main_dir: str, pr_dir: str) -> None:
+def run(main_dir: str, pr_dir: str, main_label: str, pr_label: str) -> None:
     main_runs = load_runs(Path(main_dir))
     pr_runs = load_runs(Path(pr_dir))
     concs = sorted(set(main_runs) | set(pr_runs))
 
+    # Value cells are "  9.99±  9.99" — 17 chars. Pad header to match,
+    # but widen if a custom label is longer.
+    col_w = max(17, len(main_label), len(pr_label))
+
     for key, label, prec in METRICS:
         print(f"\n## {label}")
-        print(f"{'conc':>5} | {'main':>18} | {'PR':>18} | {'delta':>8}")
-        print("-" * 60)
+        print(
+            f"{'conc':>5} | {main_label:>{col_w}} | {pr_label:>{col_w}} | {'delta':>8}"
+        )
+        print("-" * (5 + 3 + col_w + 3 + col_w + 3 + 8))
         for c in concs:
             m, ms = agg(main_runs.get(c, []), key)
             p, ps = agg(pr_runs.get(c, []), key)
@@ -63,13 +71,29 @@ def main(main_dir: str, pr_dir: str) -> None:
                 delta_s = f"{sign}{delta:.1f}%"
             else:
                 delta_s = "n/a"
-            print(
-                f"{c:>5} | {fmt(m, prec):>9}±{fmt(ms, prec):<7} | "
-                f"{fmt(p, prec):>9}±{fmt(ps, prec):<7} | {delta_s:>8}"
-            )
+            m_cell = f"{fmt(m, prec):>9}±{fmt(ms, prec):<7}"
+            p_cell = f"{fmt(p, prec):>9}±{fmt(ps, prec):<7}"
+            print(f"{c:>5} | {m_cell:>{col_w}} | {p_cell:>{col_w}} | {delta_s:>8}")
+
+
+def parse_labels(s: str) -> tuple[str, str]:
+    parts = s.split(":")
+    if len(parts) != 2 or not all(parts):
+        raise argparse.ArgumentTypeError(
+            "expected 'BASELINE_LABEL:COMPARISON_LABEL' (colon-separated)"
+        )
+    return parts[0], parts[1]
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        sys.exit("usage: bench_summarize.py <main_dir> <pr_dir>")
-    main(sys.argv[1], sys.argv[2])
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("main_dir", help="baseline results dir")
+    p.add_argument("pr_dir", help="comparison results dir")
+    p.add_argument(
+        "--labels",
+        type=parse_labels,
+        default=("main", "PR"),
+        help="colon-separated column labels, e.g. 'APC=off:APC=on'",
+    )
+    args = p.parse_args()
+    run(args.main_dir, args.pr_dir, args.labels[0], args.labels[1])
