@@ -17,8 +17,9 @@ torch_compile_start_time: float = 0.0
 @contextlib.contextmanager
 def monitor_torch_compile(
     vllm_config: VllmConfig,
-    message: str = "torch.compile took %.2f s in total",
+    message: str = "%storch.compile took %.2f s in total",
     is_encoder: bool = False,
+    tag: str = "",
 ) -> Generator[None, None, None]:
     """Context manager that times torch.compile and manages depyf debugging.
 
@@ -29,6 +30,9 @@ def monitor_torch_compile(
     torch_compile_start_time = time.perf_counter()
 
     compilation_config = vllm_config.compilation_config
+    log_prefix = f"[{tag}] " if tag else ""
+    if compilation_config.mode == CompilationMode.VLLM_COMPILE:
+        logger.info("%sStarting torch.compile", log_prefix)
     depyf_cm = None
     path = vllm_config.compile_debug_dump_path()
     if compilation_config.mode == CompilationMode.VLLM_COMPILE and path:
@@ -50,7 +54,7 @@ def monitor_torch_compile(
                 compilation_config.encoder_compilation_time += total_compile_time
             else:
                 compilation_config.compilation_time += total_compile_time
-            logger.info_once(message, total_compile_time)
+            logger.info(message, log_prefix, total_compile_time)
     finally:
         if depyf_cm is not None:
             try:
@@ -60,7 +64,7 @@ def monitor_torch_compile(
 
 
 @contextlib.contextmanager
-def monitor_profiling_run() -> Generator[None, None, None]:
+def monitor_profiling_run(tag: str = "") -> Generator[None, None, None]:
     """Context manager that times the initial profiling run.
 
     Asserts that no backend compilation occurs during the profiling run
@@ -78,8 +82,10 @@ def monitor_profiling_run() -> Generator[None, None, None]:
         "backend compilation occurred during the initial profiling run; "
         "all compilation should be complete before the profiling run starts."
     )
-    logger.info_once(
-        "Initial profiling/warmup run took %.2f s",
+    log_prefix = f"[{tag}] " if tag else ""
+    logger.info(
+        "%sInitial profiling/warmup run took %.2f s",
+        log_prefix,
         elapsed,
     )
 

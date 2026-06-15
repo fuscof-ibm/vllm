@@ -291,7 +291,11 @@ def _try_load_aot_compiled_fn(
     Re-raises on failure when ``VLLM_FORCE_AOT_LOAD`` is set.
     """
     try:
-        with monitor_torch_compile(model.vllm_config, is_encoder=model._is_encoder):
+        with monitor_torch_compile(
+            model.vllm_config,
+            is_encoder=model._is_encoder,
+            tag=getattr(model, "_compile_tag", ""),
+        ):
             with (
                 set_current_vllm_config(model.vllm_config),
                 open(aot_compilation_path, "rb") as f,
@@ -308,8 +312,12 @@ def _try_load_aot_compiled_fn(
             with maybe_use_cudagraph_partition_wrapper(model.vllm_config):
                 loaded_fn._artifacts.compiled_fn.finalize_loading(model.vllm_config)
             compilation_counter.num_aot_artifacts_loaded += 1
+            tag = getattr(model, "_compile_tag", "")
+            log_prefix = f"[{tag}] " if tag else ""
             logger.info(
-                "Directly load AOT compilation from path %s", aot_compilation_path
+                "%sDirectly load AOT compilation from path %s",
+                log_prefix,
+                aot_compilation_path,
             )
         return loaded_fn
     except Exception as e:
@@ -401,6 +409,16 @@ def _support_torch_compile(
         self.was_aot_compile_fn_loaded_from_disk = False
         compilation_counter.num_models_seen += 1
         self.compiled = False
+
+        # Capture the active model tag (e.g. "backbone", "eagle_head") so
+        # later compilation/warmup log lines can identify which component
+        # they belong to. The tag is a module-level global on
+        # `vllm.compilation.backends`, set by `set_model_tag()` during
+        # model construction; read it now while we're still inside that
+        # window.
+        from vllm.compilation.backends import model_tag as _current_model_tag
+
+        self._compile_tag = prefix or _current_model_tag
 
         # Handled by monkeypatching `TorchCompileWithNoGuardsWrapper` into base class
         TorchCompileWithNoGuardsWrapper.__init__(
@@ -658,7 +676,9 @@ def _support_torch_compile(
                 self._aot_compilation_path = aot_compilation_path
                 self._aot_cache_dir = cache_dir
                 with monitor_torch_compile(
-                    self.vllm_config, is_encoder=self._is_encoder
+                    self.vllm_config,
+                    is_encoder=self._is_encoder,
+                    tag=self._compile_tag,
                 ):
                     self.aot_compiled_fn = self.aot_compile(*args, **kwargs)
                     compilation_counter.num_aot_compiles += 1
@@ -666,14 +686,15 @@ def _support_torch_compile(
                     # AOT artifact.
                     self.save_aot_compiled_function()
 
-                with monitor_profiling_run():
+                with monitor_profiling_run(tag=self._compile_tag):
                     output = self.aot_compiled_fn(self, *args, **kwargs)
             else:
                 with monitor_torch_compile(
                     self.vllm_config,
-                    "torch.compile and initial profiling/warmup "
+                    "%storch.compile and initial profiling/warmup "
                     "run together took %.2f s in total",
                     is_encoder=self._is_encoder,
+                    tag=self._compile_tag,
                 ):
                     output = TorchCompileWithNoGuardsWrapper.__call__(
                         self,  # type: ignore[arg-type]
