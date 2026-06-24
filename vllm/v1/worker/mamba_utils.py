@@ -7,7 +7,9 @@ from typing import Any
 
 import torch
 
+import vllm.envs as envs
 from vllm.config import CacheConfig
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     get_conv_copy_spec,
@@ -21,6 +23,19 @@ from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
+
+logger = init_logger(__name__)
+
+# Candidates explored when ``VLLM_MAMBA_COPY_AUTOTUNE=1`` calibrates the inner
+# memcpy block size of ``postprocess_mamba_fused_kernel`` at first launch.
+_COPY_BLOCK_SIZE_CANDIDATES: tuple[int, ...] = (128, 256, 512, 1024, 2048, 4096)
+# Default used when calibration is disabled or fails. Matches the legacy
+# constant baked into the kernel before autotuning was introduced.
+_COPY_BLOCK_SIZE_DEFAULT: int = 1024
+# Calibration is run at this batch size (capped by ``max_num_reqs``). Picked
+# as a typical decode batch — large enough to saturate SMs on common GPUs,
+# small enough to keep scratch memory bounded.
+_CALIBRATION_BATCH_SIZE: int = 32
 
 
 @triton.jit
@@ -323,6 +338,10 @@ class MambaSpecDecodeGPUContext:
     # Flag to track if metadata has been populated
     is_initialized: bool = False
 
+    # Inner-loop block size for the fused memcpy. Replaced by
+    # ``_calibrate_copy_block_size`` when ``VLLM_MAMBA_COPY_AUTOTUNE=1``.
+    copy_block_size: int = _COPY_BLOCK_SIZE_DEFAULT
+
     @classmethod
     def create(
         cls,
@@ -508,6 +527,144 @@ class MambaSpecDecodeGPUContext:
 
         self.is_initialized = True
 
+        if envs.VLLM_MAMBA_COPY_AUTOTUNE:
+            self.copy_block_size = self._calibrate_copy_block_size()
+
+    def _calibrate_copy_block_size(self) -> int:
+        """Time ``postprocess_mamba_fused_kernel`` over candidate inner-loop
+        block sizes and return the fastest.
+
+        The kernel mutates the live mamba state cache through pointers loaded
+        from ``state_base_addrs_ptr``, so Triton's standard ``@autotune`` is
+        unsafe here (its warmup runs would corrupt the cache and Triton's
+        ``restore_value`` cannot roll back writes through indirected pointers).
+        Instead we build a one-shot scratch metadata snapshot whose
+        ``state_base_addrs`` and ``block_table_ptrs`` point at fresh scratch
+        buffers; the real metadata stays untouched. Synthetic per-request
+        inputs choose ``src_block_idx=1, dest_block_idx=0, accept_token_bias=0``
+        so every program enters the copy path.
+        """
+        try:
+            import triton.testing
+        except ImportError:
+            logger.warning(
+                "VLLM_MAMBA_COPY_AUTOTUNE=1 but triton.testing is unavailable; "
+                "falling back to COPY_BLOCK_SIZE=%d",
+                _COPY_BLOCK_SIZE_DEFAULT,
+            )
+            return _COPY_BLOCK_SIZE_DEFAULT
+
+        device = self.state_base_addrs.device
+        max_num_reqs = int(self.num_accepted_tokens_out.shape[0])
+        num_reqs = min(max_num_reqs, _CALIBRATION_BATCH_SIZE)
+        if num_reqs <= 0:
+            return _COPY_BLOCK_SIZE_DEFAULT
+
+        total_states = self.num_layers * self.num_state_types
+
+        # Scratch state buffers: 2 blocks per state, addressed by
+        # synthetic block ids 0 (dest) and 1 (src).
+        block_strides_cpu = self.state_block_strides.cpu().tolist()
+        scratch_states: list[torch.Tensor] = []
+        scratch_base_addrs = torch.zeros(total_states, dtype=torch.int64, device=device)
+        for idx in range(total_states):
+            nbytes = max(1, 2 * int(block_strides_cpu[idx]))
+            scratch = torch.zeros(nbytes, dtype=torch.uint8, device=device)
+            scratch_states.append(scratch)
+            scratch_base_addrs[idx] = scratch.data_ptr()
+
+        # One synthetic block table per group: shape [num_reqs, 2],
+        # column 0 = dest block id (0), column 1 = src block id (1).
+        scratch_block_tables: list[torch.Tensor] = []
+        scratch_block_table_ptrs = torch.zeros(
+            self.num_groups, dtype=torch.int64, device=device
+        )
+        for g in range(self.num_groups):
+            bt = torch.zeros((num_reqs, 2), dtype=torch.int32, device=device)
+            bt[:, 1] = 1
+            scratch_block_tables.append(bt)
+            scratch_block_table_ptrs[g] = bt.data_ptr()
+        scratch_stride_req = 2
+
+        # Synthetic per-request inputs. With these values the kernel resolves to
+        #   num_tokens_running_state = block_size,
+        #   new_num_computed = block_size, aligned_new_computed = block_size,
+        #   needs_copy = True, accept_token_bias = 0,
+        #   src_block_idx = 1, dest_block_idx = 0,
+        # so every program takes the copy path with a representative payload.
+        num_accepted = torch.ones(num_reqs, dtype=torch.int32, device=device)
+        mamba_state_idx = torch.ones(num_reqs, dtype=torch.int32, device=device)
+        num_scheduled = torch.full(
+            (num_reqs,), self.block_size, dtype=torch.int32, device=device
+        )
+        num_computed = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+        num_draft = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+        accepted_out = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+
+        grid = (num_reqs, total_states)
+        conv_dim_first = is_conv_state_dim_first()
+
+        def _run(cbs: int) -> None:
+            postprocess_mamba_fused_kernel[grid](
+                num_accepted,
+                mamba_state_idx,
+                num_scheduled,
+                num_computed,
+                num_draft,
+                scratch_block_table_ptrs,
+                scratch_stride_req,
+                scratch_base_addrs,
+                self.state_block_strides,
+                self.state_elem_sizes,
+                self.state_inner_sizes,
+                self.state_conv_widths,
+                self.state_group_indices,
+                self.state_dim_row_count,
+                self.state_dim_row_stride,
+                accepted_out,
+                num_reqs,
+                block_size=self.block_size,
+                COPY_BLOCK_SIZE=cbs,
+                CONV_STATE_DIM_FIRST=conv_dim_first,
+            )
+
+        best_ms = float("inf")
+        best_cbs = _COPY_BLOCK_SIZE_DEFAULT
+        timings: list[tuple[int, float]] = []
+        for cand in _COPY_BLOCK_SIZE_CANDIDATES:
+            try:
+                ms = float(
+                    triton.testing.do_bench(lambda c=cand: _run(c), warmup=10, rep=50)
+                )
+            except Exception as exc:
+                logger.warning(
+                    "mamba copy autotune: COPY_BLOCK_SIZE=%d failed (%s)",
+                    cand,
+                    exc,
+                )
+                continue
+            timings.append((cand, ms))
+            if ms < best_ms:
+                best_ms = ms
+                best_cbs = cand
+
+        if not timings:
+            logger.warning(
+                "mamba copy autotune: no candidate succeeded; "
+                "falling back to COPY_BLOCK_SIZE=%d",
+                _COPY_BLOCK_SIZE_DEFAULT,
+            )
+            return _COPY_BLOCK_SIZE_DEFAULT
+
+        logger.info(
+            "mamba copy autotune (num_reqs=%d, num_states=%d): %s -> picked %d",
+            num_reqs,
+            total_states,
+            ", ".join(f"{c}:{ms:.4f}ms" for c, ms in timings),
+            best_cbs,
+        )
+        return best_cbs
+
     def run_fused_postprocess(
         self,
         num_reqs: int,
@@ -561,7 +718,7 @@ class MambaSpecDecodeGPUContext:
             self.num_accepted_tokens_out,
             num_reqs,
             block_size=self.block_size,
-            COPY_BLOCK_SIZE=1024,
+            COPY_BLOCK_SIZE=self.copy_block_size,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
         )
 

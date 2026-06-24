@@ -109,6 +109,7 @@ if TYPE_CHECKING:
     VLLM_USE_TRITON_AWQ: bool = False
     VLLM_FASTSAFETENSORS_QUEUE_SIZE: int = 0
     VLLM_TRITON_FORCE_FIRST_CONFIG: bool = False
+    VLLM_MAMBA_COPY_AUTOTUNE: bool = False
     VLLM_ALLOW_RUNTIME_LORA_UPDATING: bool = False
     VLLM_SKIP_P2P_CHECK: bool = False
     VLLM_DISABLED_KERNELS: list[str] = []
@@ -1082,6 +1083,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TRITON_FORCE_FIRST_CONFIG": lambda: (
         os.environ.get("VLLM_TRITON_FORCE_FIRST_CONFIG", "0").strip().lower()
         in ("1", "true")
+    ),
+    # If set, calibrate COPY_BLOCK_SIZE for the fused mamba postprocess kernel
+    # at first launch by timing the kernel against scratch buffers and picking
+    # the fastest config. Off by default so first-step latency stays bounded;
+    # enable to evaluate gains across models / GPU architectures.
+    "VLLM_MAMBA_COPY_AUTOTUNE": lambda: (
+        os.environ.get("VLLM_MAMBA_COPY_AUTOTUNE", "0").strip().lower() in ("1", "true")
     ),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (
