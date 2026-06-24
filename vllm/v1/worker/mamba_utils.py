@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import dataclasses
 import itertools
+import math
 from collections.abc import Callable
 from typing import Any
 
@@ -32,10 +33,12 @@ _COPY_BLOCK_SIZE_CANDIDATES: tuple[int, ...] = (128, 256, 512, 1024, 2048, 4096)
 # Default used when calibration is disabled or fails. Matches the legacy
 # constant baked into the kernel before autotuning was introduced.
 _COPY_BLOCK_SIZE_DEFAULT: int = 1024
-# Calibration is run at this batch size (capped by ``max_num_reqs``). Picked
-# as a typical decode batch — large enough to saturate SMs on common GPUs,
-# small enough to keep scratch memory bounded.
-_CALIBRATION_BATCH_SIZE: int = 32
+# Calibration is run at each of these batch sizes (each capped by
+# ``max_num_reqs``); the candidate with the lowest geometric mean of
+# normalized slowdown across all sweeps is picked. Covers the common decode
+# regimes (single stream, small concurrent, full saturation) so the chosen
+# block size is robust across workloads, not just the one calibration size.
+_CALIBRATION_BATCH_SIZES: tuple[int, ...] = (1, 8, 32)
 
 
 @triton.jit
@@ -556,14 +559,26 @@ class MambaSpecDecodeGPUContext:
 
         device = self.state_base_addrs.device
         max_num_reqs = int(self.num_accepted_tokens_out.shape[0])
-        num_reqs = min(max_num_reqs, _CALIBRATION_BATCH_SIZE)
-        if num_reqs <= 0:
+        if max_num_reqs <= 0:
+            return _COPY_BLOCK_SIZE_DEFAULT
+
+        # Dedup batch sizes after capping by max_num_reqs (preserve order).
+        seen: set[int] = set()
+        batch_sizes: list[int] = []
+        for target in _CALIBRATION_BATCH_SIZES:
+            bs = min(target, max_num_reqs)
+            if bs > 0 and bs not in seen:
+                seen.add(bs)
+                batch_sizes.append(bs)
+        if not batch_sizes:
             return _COPY_BLOCK_SIZE_DEFAULT
 
         total_states = self.num_layers * self.num_state_types
+        max_bs = max(batch_sizes)
 
         # Scratch state buffers: 2 blocks per state, addressed by
-        # synthetic block ids 0 (dest) and 1 (src).
+        # synthetic block ids 0 (dest) and 1 (src). Sized once and reused
+        # across all batch-size sweeps.
         block_strides_cpu = self.state_block_strides.cpu().tolist()
         scratch_states: list[torch.Tensor] = []
         scratch_base_addrs = torch.zeros(total_states, dtype=torch.int64, device=device)
@@ -573,39 +588,40 @@ class MambaSpecDecodeGPUContext:
             scratch_states.append(scratch)
             scratch_base_addrs[idx] = scratch.data_ptr()
 
-        # One synthetic block table per group: shape [num_reqs, 2],
-        # column 0 = dest block id (0), column 1 = src block id (1).
+        # One synthetic block table per group, sized at the largest batch:
+        # column 0 = dest block id (0), column 1 = src block id (1). Smaller
+        # batches launch with a smaller grid and only read the prefix.
         scratch_block_tables: list[torch.Tensor] = []
         scratch_block_table_ptrs = torch.zeros(
             self.num_groups, dtype=torch.int64, device=device
         )
         for g in range(self.num_groups):
-            bt = torch.zeros((num_reqs, 2), dtype=torch.int32, device=device)
+            bt = torch.zeros((max_bs, 2), dtype=torch.int32, device=device)
             bt[:, 1] = 1
             scratch_block_tables.append(bt)
             scratch_block_table_ptrs[g] = bt.data_ptr()
         scratch_stride_req = 2
 
-        # Synthetic per-request inputs. With these values the kernel resolves to
+        # Synthetic per-request inputs sized at max_bs. With these values the
+        # kernel resolves to:
         #   num_tokens_running_state = block_size,
         #   new_num_computed = block_size, aligned_new_computed = block_size,
         #   needs_copy = True, accept_token_bias = 0,
         #   src_block_idx = 1, dest_block_idx = 0,
         # so every program takes the copy path with a representative payload.
-        num_accepted = torch.ones(num_reqs, dtype=torch.int32, device=device)
-        mamba_state_idx = torch.ones(num_reqs, dtype=torch.int32, device=device)
+        num_accepted = torch.ones(max_bs, dtype=torch.int32, device=device)
+        mamba_state_idx = torch.ones(max_bs, dtype=torch.int32, device=device)
         num_scheduled = torch.full(
-            (num_reqs,), self.block_size, dtype=torch.int32, device=device
+            (max_bs,), self.block_size, dtype=torch.int32, device=device
         )
-        num_computed = torch.zeros(num_reqs, dtype=torch.int32, device=device)
-        num_draft = torch.zeros(num_reqs, dtype=torch.int32, device=device)
-        accepted_out = torch.zeros(num_reqs, dtype=torch.int32, device=device)
+        num_computed = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        num_draft = torch.zeros(max_bs, dtype=torch.int32, device=device)
+        accepted_out = torch.zeros(max_bs, dtype=torch.int32, device=device)
 
-        grid = (num_reqs, total_states)
         conv_dim_first = is_conv_state_dim_first()
 
-        def _run(cbs: int) -> None:
-            postprocess_mamba_fused_kernel[grid](
+        def _run(bs: int, cbs: int) -> None:
+            postprocess_mamba_fused_kernel[(bs, total_states)](
                 num_accepted,
                 mamba_state_idx,
                 num_scheduled,
@@ -622,33 +638,38 @@ class MambaSpecDecodeGPUContext:
                 self.state_dim_row_count,
                 self.state_dim_row_stride,
                 accepted_out,
-                num_reqs,
+                bs,
                 block_size=self.block_size,
                 COPY_BLOCK_SIZE=cbs,
                 CONV_STATE_DIM_FIRST=conv_dim_first,
             )
 
-        best_ms = float("inf")
-        best_cbs = _COPY_BLOCK_SIZE_DEFAULT
-        timings: list[tuple[int, float]] = []
-        for cand in _COPY_BLOCK_SIZE_CANDIDATES:
-            try:
-                ms = float(
-                    triton.testing.do_bench(lambda c=cand: _run(c), warmup=10, rep=50)
-                )
-            except Exception as exc:
-                logger.warning(
-                    "mamba copy autotune: COPY_BLOCK_SIZE=%d failed (%s)",
-                    cand,
-                    exc,
-                )
-                continue
-            timings.append((cand, ms))
-            if ms < best_ms:
-                best_ms = ms
-                best_cbs = cand
+        # results[bs][cand] = ms; only candidates timed at every batch size
+        # are scored, so a per-batch failure doesn't unfairly penalize a
+        # candidate vs ones that completed everywhere.
+        results: dict[int, dict[int, float]] = {}
+        for bs in batch_sizes:
+            cand_timings: dict[int, float] = {}
+            for cand in _COPY_BLOCK_SIZE_CANDIDATES:
+                try:
+                    ms = float(
+                        triton.testing.do_bench(
+                            lambda b=bs, c=cand: _run(b, c), warmup=10, rep=50
+                        )
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "mamba copy autotune: bs=%d COPY_BLOCK_SIZE=%d failed (%s)",
+                        bs,
+                        cand,
+                        exc,
+                    )
+                    continue
+                cand_timings[cand] = ms
+            if cand_timings:
+                results[bs] = cand_timings
 
-        if not timings:
+        if not results:
             logger.warning(
                 "mamba copy autotune: no candidate succeeded; "
                 "falling back to COPY_BLOCK_SIZE=%d",
@@ -656,11 +677,47 @@ class MambaSpecDecodeGPUContext:
             )
             return _COPY_BLOCK_SIZE_DEFAULT
 
+        # Score each candidate by geomean of (ms / best_ms_at_that_bs).
+        # Geomean (vs arithmetic) keeps the score scale-free across batch
+        # sizes — a 2x slowdown at bs=1 weighs the same as a 2x slowdown at
+        # bs=32, regardless of absolute ms differences. Only candidates with
+        # full coverage compete; partial-coverage ones fall through.
+        scores: dict[int, float] = {}
+        for cand in _COPY_BLOCK_SIZE_CANDIDATES:
+            log_ratios: list[float] = []
+            for bs, cand_timings in results.items():
+                if cand not in cand_timings:
+                    log_ratios = []
+                    break
+                best_at_bs = min(cand_timings.values())
+                if best_at_bs <= 0:
+                    log_ratios = []
+                    break
+                log_ratios.append(math.log(cand_timings[cand] / best_at_bs))
+            if log_ratios:
+                scores[cand] = math.exp(sum(log_ratios) / len(log_ratios))
+
+        if not scores:
+            logger.warning(
+                "mamba copy autotune: no candidate had full coverage across "
+                "batch sizes %s; falling back to COPY_BLOCK_SIZE=%d",
+                batch_sizes,
+                _COPY_BLOCK_SIZE_DEFAULT,
+            )
+            return _COPY_BLOCK_SIZE_DEFAULT
+
+        best_cbs = min(scores, key=scores.__getitem__)
+
+        # Per-bs timings table for diagnostics.
+        per_bs = "; ".join(
+            f"bs={bs}:" + ",".join(f"{c}={ms:.4f}ms" for c, ms in sorted(t.items()))
+            for bs, t in sorted(results.items())
+        )
         logger.info(
-            "mamba copy autotune (num_reqs=%d, num_states=%d): %s -> picked %d",
-            num_reqs,
+            "mamba copy autotune (num_states=%d) [%s] -> scores %s -> picked %d",
             total_states,
-            ", ".join(f"{c}:{ms:.4f}ms" for c, ms in timings),
+            per_bs,
+            {c: f"{s:.3f}" for c, s in sorted(scores.items())},
             best_cbs,
         )
         return best_cbs
