@@ -183,13 +183,28 @@ def postprocess_mamba_fused_kernel(
         # actual data when the state tensor uses as_strided page padding.
         copy_size = state_inner_size * state_elem_size
 
+    # Vectorize via uint64 (8B per thread → LDG.64/STG.64): both temporal
+    # and SD conv produce src/dst addresses aligned to a full token slice
+    # (inner_size * elem_size) and a copy_size that's a multiple of it,
+    # which is 8B-aligned for all state dtypes in use. A masked byte tail
+    # covers any remaining 0-7 bytes (only reachable for sub-8B slices).
+    copy_size_u64 = copy_size // 8
+    src_u64 = src_addr.to(tl.pointer_type(tl.uint64))
+    dst_u64 = dst_addr.to(tl.pointer_type(tl.uint64))
     offsets = tl.arange(0, COPY_BLOCK_SIZE)
-    for i in range(0, copy_size, COPY_BLOCK_SIZE):
-        mask = (i + offsets) < copy_size
-        curr_src = (src_addr + i + offsets).to(tl.pointer_type(tl.uint8))
-        curr_dst = (dst_addr + i + offsets).to(tl.pointer_type(tl.uint8))
-        data = tl.load(curr_src, mask=mask)
-        tl.store(curr_dst, data, mask=mask)
+    for i in range(0, copy_size_u64, COPY_BLOCK_SIZE):
+        mask = (i + offsets) < copy_size_u64
+        data = tl.load(src_u64 + i + offsets, mask=mask)
+        tl.store(dst_u64 + i + offsets, data, mask=mask)
+
+    tail_start = copy_size_u64 * 8
+    tail_bytes = copy_size - tail_start
+    tail_off = tl.arange(0, 8)
+    tail_src = (src_addr + tail_start).to(tl.pointer_type(tl.uint8))
+    tail_dst = (dst_addr + tail_start).to(tl.pointer_type(tl.uint8))
+    tail_mask = tail_off < tail_bytes
+    tail_data = tl.load(tail_src + tail_off, mask=tail_mask)
+    tl.store(tail_dst + tail_off, tail_data, mask=tail_mask)
 
 
 @triton.jit
