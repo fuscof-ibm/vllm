@@ -22,6 +22,11 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
 
+# Bytes copied per Triton program in postprocess_mamba_fused_kernel. Must
+# match the COPY_BLOCK_SIZE constexpr passed to the kernel below; the
+# host-side max_chunks computation uses the same value to size grid[2].
+_POSTPROCESS_COPY_BLOCK_SIZE = 1024
+
 
 @triton.jit
 def postprocess_mamba_fused_kernel(
@@ -62,9 +67,13 @@ def postprocess_mamba_fused_kernel(
     Fused GPU kernel for postprocess_mamba that computes decisions AND performs
     mamba state copies without any CPU-GPU synchronization.
 
-    Grid: (num_reqs, num_layers * num_state_types)
+    Grid: (num_reqs, num_layers * num_state_types, max_chunks)
     - program_id(0) = request index
     - program_id(1) = state_idx (flattened index into layer/state_type metadata)
+    - program_id(2) = chunk index over the per-(req, state) byte range; each
+      program copies one COPY_BLOCK_SIZE-byte slice and exits. ``max_chunks``
+      is the upper bound across all states; programs whose chunk falls past
+      this state's copy size return immediately.
 
     Note: num_layers and num_state_types are not passed as kernel parameters
     because the kernel indexes directly into pre-flattened metadata arrays
@@ -72,6 +81,7 @@ def postprocess_mamba_fused_kernel(
     """
     req_idx = tl.program_id(0)
     state_idx = tl.program_id(1)
+    chunk_idx = tl.program_id(2)
 
     # Bounds check
     if req_idx >= num_reqs:
@@ -126,8 +136,9 @@ def postprocess_mamba_fused_kernel(
     # conv_width == 0 means this is a temporal state (get_temporal_copy_spec logic)
     is_conv_state = conv_width > 0
 
-    # Update accepted-token count before early exits.
-    if src_block_idx == dest_block_idx and state_idx == 0:
+    # Update accepted-token count before early exits. Only one chunk per
+    # request writes (the store is idempotent, but extra writes are wasted).
+    if src_block_idx == dest_block_idx and state_idx == 0 and chunk_idx == 0:
         tl.store(num_accepted_tokens_out_ptr + req_idx, 1)
 
     # Skip no-op self-copy.
@@ -141,16 +152,21 @@ def postprocess_mamba_fused_kernel(
         bias_bytes = accept_token_bias.to(tl.int64) * state_elem_size
         src_block_addr = state_base_addr + src_block_id * state_block_stride
         dst_block_addr = state_base_addr + dest_block_id * state_block_stride
+        # Linearize this state's (d, i_in_row) work into chunk_idx so the
+        # outer 3D grid carries the parallelism instead of a serial loop.
+        chunks_per_row = tl.cdiv(per_row_bytes, COPY_BLOCK_SIZE)
+        d = chunk_idx // chunks_per_row
+        if d >= dim_rows:
+            return
+        i_in_row = (chunk_idx - d * chunks_per_row) * COPY_BLOCK_SIZE
         offsets = tl.arange(0, COPY_BLOCK_SIZE)
-        for d in range(0, dim_rows):
-            row_src = src_block_addr + d * row_stride + bias_bytes
-            row_dst = dst_block_addr + d * row_stride
-            for i in range(0, per_row_bytes, COPY_BLOCK_SIZE):
-                mask = (i + offsets) < per_row_bytes
-                curr_src = (row_src + i + offsets).to(tl.pointer_type(tl.uint8))
-                curr_dst = (row_dst + i + offsets).to(tl.pointer_type(tl.uint8))
-                data = tl.load(curr_src, mask=mask)
-                tl.store(curr_dst, data, mask=mask)
+        row_src = src_block_addr + d * row_stride + bias_bytes
+        row_dst = dst_block_addr + d * row_stride
+        mask = (i_in_row + offsets) < per_row_bytes
+        curr_src = (row_src + i_in_row + offsets).to(tl.pointer_type(tl.uint8))
+        curr_dst = (row_dst + i_in_row + offsets).to(tl.pointer_type(tl.uint8))
+        data = tl.load(curr_src, mask=mask)
+        tl.store(curr_dst, data, mask=mask)
         return
 
     if is_conv_state:
@@ -183,13 +199,15 @@ def postprocess_mamba_fused_kernel(
         # actual data when the state tensor uses as_strided page padding.
         copy_size = state_inner_size * state_elem_size
 
+    chunk_offset = chunk_idx * COPY_BLOCK_SIZE
+    if chunk_offset >= copy_size:
+        return
     offsets = tl.arange(0, COPY_BLOCK_SIZE)
-    for i in range(0, copy_size, COPY_BLOCK_SIZE):
-        mask = (i + offsets) < copy_size
-        curr_src = (src_addr + i + offsets).to(tl.pointer_type(tl.uint8))
-        curr_dst = (dst_addr + i + offsets).to(tl.pointer_type(tl.uint8))
-        data = tl.load(curr_src, mask=mask)
-        tl.store(curr_dst, data, mask=mask)
+    mask = (chunk_offset + offsets) < copy_size
+    curr_src = (src_addr + chunk_offset + offsets).to(tl.pointer_type(tl.uint8))
+    curr_dst = (dst_addr + chunk_offset + offsets).to(tl.pointer_type(tl.uint8))
+    data = tl.load(curr_src, mask=mask)
+    tl.store(curr_dst, data, mask=mask)
 
 
 @triton.jit
@@ -320,6 +338,12 @@ class MambaSpecDecodeGPUContext:
     num_computed_tokens_buf: CpuGpuBuffer | None = None
     num_draft_tokens_buf: CpuGpuBuffer | None = None
 
+    # Upper bound on the number of COPY_BLOCK_SIZE-byte chunks any single
+    # state copy can require; used as grid[2] of the fused kernel so each
+    # chunk runs as its own Triton program. Populated alongside the metadata
+    # tensors in initialize_from_forward_context.
+    max_chunks: int = 1
+
     # Flag to track if metadata has been populated
     is_initialized: bool = False
 
@@ -382,6 +406,7 @@ class MambaSpecDecodeGPUContext:
             num_scheduled_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             num_computed_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             num_draft_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            max_chunks=1,
             is_initialized=False,
         )
 
@@ -429,6 +454,7 @@ class MambaSpecDecodeGPUContext:
         if self.is_initialized:
             return
 
+        max_chunks = 1
         idx = 0
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
             layer_names = kv_cache_config.kv_cache_groups[mamba_group_id].layer_names
@@ -458,6 +484,7 @@ class MambaSpecDecodeGPUContext:
                         copy_func is get_conv_copy_spec
                         or copy_func is get_temporal_copy_spec
                     ), f"unexpected copy func: {copy_func}"
+                    elem_size = state.element_size()
                     if copy_func is get_conv_copy_spec:
                         if state.dim() != 3:
                             raise ValueError(
@@ -469,13 +496,19 @@ class MambaSpecDecodeGPUContext:
                             self.state_conv_widths[idx] = state.size(2)
                             self.state_inner_sizes[idx] = 1
                             self.state_dim_row_count[idx] = state.size(1)
-                            self.state_dim_row_stride[idx] = (
-                                state.stride(1) * state.element_size()
+                            self.state_dim_row_stride[idx] = state.stride(1) * elem_size
+                            # Upper bound (bias=0): one chunk per
+                            # COPY_BLOCK_SIZE-byte slice, per dim row.
+                            per_row_bytes = state.size(2) * elem_size
+                            state_chunks = state.size(1) * cdiv(
+                                per_row_bytes, _POSTPROCESS_COPY_BLOCK_SIZE
                             )
                         else:
                             # SD layout: dim is contiguous.
                             self.state_conv_widths[idx] = state.size(1)
                             self.state_inner_sizes[idx] = state.stride(1)
+                            copy_size = state.size(1) * state.stride(1) * elem_size
+                            state_chunks = cdiv(copy_size, _POSTPROCESS_COPY_BLOCK_SIZE)
                     else:
                         # Temporal state: inner_size = natural elements per
                         # block (prod of inner dims).  The kernel uses this
@@ -484,9 +517,13 @@ class MambaSpecDecodeGPUContext:
                         # state tensor is as_strided with padded page strides
                         # (state_block_stride would be the page size, too big).
                         self.state_conv_widths[idx] = 0
-                        self.state_inner_sizes[idx] = (
-                            state[0].numel() if state.dim() > 1 else 1
-                        )
+                        inner_size = state[0].numel() if state.dim() > 1 else 1
+                        self.state_inner_sizes[idx] = inner_size
+                        copy_size = inner_size * elem_size
+                        state_chunks = cdiv(copy_size, _POSTPROCESS_COPY_BLOCK_SIZE)
+
+                    if state_chunks > max_chunks:
+                        max_chunks = state_chunks
 
                     self.state_group_indices[idx] = group_local_idx
                     idx += 1
@@ -506,6 +543,7 @@ class MambaSpecDecodeGPUContext:
         for i, bt in enumerate(block_tables):
             self.block_table_ptrs[i] = bt.data_ptr()
 
+        self.max_chunks = max_chunks
         self.is_initialized = True
 
     def run_fused_postprocess(
@@ -540,7 +578,7 @@ class MambaSpecDecodeGPUContext:
         )
 
         total_states = self.num_layers * self.num_state_types
-        grid = (num_reqs, total_states)
+        grid = (num_reqs, total_states, self.max_chunks)
 
         postprocess_mamba_fused_kernel[grid](
             num_accepted_tokens_gpu,
@@ -561,7 +599,7 @@ class MambaSpecDecodeGPUContext:
             self.num_accepted_tokens_out,
             num_reqs,
             block_size=self.block_size,
-            COPY_BLOCK_SIZE=1024,
+            COPY_BLOCK_SIZE=_POSTPROCESS_COPY_BLOCK_SIZE,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
         )
 
