@@ -57,6 +57,11 @@ def postprocess_mamba_fused_kernel(
     # COPY_BLOCK_SIZE: fixed tuning parameter for memory copy loop
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
+    # Per-model constant: bytes per temporal-state block
+    # (inner_size * elem_size). Passing it as a constexpr lets Triton fold the
+    # loop trip count and drop the tail mask when it divides COPY_BLOCK_SIZE.
+    # Set to 0 when the model has no temporal states (branch is dead-code).
+    TEMPORAL_COPY_BYTES: tl.constexpr,
 ):
     """
     Fused GPU kernel for postprocess_mamba that computes decisions AND performs
@@ -153,35 +158,52 @@ def postprocess_mamba_fused_kernel(
                 tl.store(curr_dst, data, mask=mask)
         return
 
-    if is_conv_state:
-        # SD conv: copy
-        #   state[block_table[req_idx, src_block_idx],  accept_token_bias:]
-        # to
-        #   state[block_table[req_idx, dest_block_idx], :conv_width - accept_token_bias]
-        src_offset = accept_token_bias.to(tl.int64) * state_inner_size * state_elem_size
-        src_addr = state_base_addr + src_block_id * state_block_stride + src_offset
-        dst_addr = state_base_addr + dest_block_id * state_block_stride
-        # Number of elements to copy:
-        # (conv_width - accept_token_bias) * inner_size
-        num_elems_to_copy = (conv_width - accept_token_bias).to(
-            tl.int64
-        ) * state_inner_size
-        copy_size = num_elems_to_copy * state_elem_size
-    else:
+    if not is_conv_state:
         # Temporal state: copy
         #   state[block_table[req_idx, src_block_idx + accept_token_bias]]
         # to
         #   state[block_table[req_idx, dest_block_idx]]
+        # The copy size is TEMPORAL_COPY_BYTES (inner_size * elem_size),
+        # a per-model constant validated to be uniform across temporal states
+        # in initialize_from_forward_context. Passing it as constexpr lets
+        # Triton fold the loop trip count and drop the tail mask when aligned.
+        # Note: we use this natural block data size rather than
+        # state_block_stride, which is the page stride and can exceed the
+        # actual data when the state tensor uses as_strided page padding.
         actual_src_block_idx = src_block_idx + accept_token_bias
         actual_src_block_id = tl.load(block_table_base + actual_src_block_idx).to(
             tl.int64
         )
         src_addr = state_base_addr + actual_src_block_id * state_block_stride
         dst_addr = state_base_addr + dest_block_id * state_block_stride
-        # Use natural block data size (inner_size * elem_size), NOT
-        # state_block_stride which is the page stride and can exceed the
-        # actual data when the state tensor uses as_strided page padding.
-        copy_size = state_inner_size * state_elem_size
+
+        offsets = tl.arange(0, COPY_BLOCK_SIZE)
+        if TEMPORAL_COPY_BYTES % COPY_BLOCK_SIZE == 0:
+            for i in range(0, TEMPORAL_COPY_BYTES, COPY_BLOCK_SIZE):
+                curr_src = (src_addr + i + offsets).to(tl.pointer_type(tl.uint8))
+                curr_dst = (dst_addr + i + offsets).to(tl.pointer_type(tl.uint8))
+                data = tl.load(curr_src)
+                tl.store(curr_dst, data)
+        else:
+            for i in range(0, TEMPORAL_COPY_BYTES, COPY_BLOCK_SIZE):
+                mask = (i + offsets) < TEMPORAL_COPY_BYTES
+                curr_src = (src_addr + i + offsets).to(tl.pointer_type(tl.uint8))
+                curr_dst = (dst_addr + i + offsets).to(tl.pointer_type(tl.uint8))
+                data = tl.load(curr_src, mask=mask)
+                tl.store(curr_dst, data, mask=mask)
+        return
+
+    # SD conv: copy
+    #   state[block_table[req_idx, src_block_idx],  accept_token_bias:]
+    # to
+    #   state[block_table[req_idx, dest_block_idx], :conv_width - accept_token_bias]
+    src_offset = accept_token_bias.to(tl.int64) * state_inner_size * state_elem_size
+    src_addr = state_base_addr + src_block_id * state_block_stride + src_offset
+    dst_addr = state_base_addr + dest_block_id * state_block_stride
+    # Number of elements to copy:
+    # (conv_width - accept_token_bias) * inner_size
+    num_elems_to_copy = (conv_width - accept_token_bias).to(tl.int64) * state_inner_size
+    copy_size = num_elems_to_copy * state_elem_size
 
     offsets = tl.arange(0, COPY_BLOCK_SIZE)
     for i in range(0, copy_size, COPY_BLOCK_SIZE):
@@ -323,6 +345,14 @@ class MambaSpecDecodeGPUContext:
     # Flag to track if metadata has been populated
     is_initialized: bool = False
 
+    # Per-model constant: bytes per temporal-state block
+    # (inner_size * elem_size). Computed during
+    # ``initialize_from_forward_context`` and passed as a constexpr to the
+    # fused kernel, letting Triton fold the temporal copy loop trip count
+    # and drop the tail mask when aligned. Stays 0 if the model has no
+    # temporal states.
+    temporal_copy_bytes: int = 0
+
     @classmethod
     def create(
         cls,
@@ -429,6 +459,11 @@ class MambaSpecDecodeGPUContext:
         if self.is_initialized:
             return
 
+        # Collected per-temporal-state copy sizes (inner_size * elem_size).
+        # All temporal states are required to share the same value so we can
+        # pass it as a constexpr to the fused kernel.
+        temporal_copy_bytes_seen: set[int] = set()
+
         idx = 0
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
             layer_names = kv_cache_config.kv_cache_groups[mamba_group_id].layer_names
@@ -483,10 +518,10 @@ class MambaSpecDecodeGPUContext:
                         # which gives the correct byte count even when the
                         # state tensor is as_strided with padded page strides
                         # (state_block_stride would be the page size, too big).
+                        inner = state[0].numel() if state.dim() > 1 else 1
                         self.state_conv_widths[idx] = 0
-                        self.state_inner_sizes[idx] = (
-                            state[0].numel() if state.dim() > 1 else 1
-                        )
+                        self.state_inner_sizes[idx] = inner
+                        temporal_copy_bytes_seen.add(int(inner) * state.element_size())
 
                     self.state_group_indices[idx] = group_local_idx
                     idx += 1
@@ -505,6 +540,16 @@ class MambaSpecDecodeGPUContext:
         self.block_table_stride_req = int(next(iter(strides)))
         for i, bt in enumerate(block_tables):
             self.block_table_ptrs[i] = bt.data_ptr()
+
+        # Validate uniformity and cache the constexpr temporal copy size.
+        # The MambaSpec equality assertion in get_mamba_groups guarantees
+        # this in practice; the explicit check guards against drift.
+        if temporal_copy_bytes_seen:
+            assert len(temporal_copy_bytes_seen) == 1, (
+                "all temporal mamba states must share inner_size * elem_size; "
+                f"got {temporal_copy_bytes_seen}"
+            )
+            self.temporal_copy_bytes = next(iter(temporal_copy_bytes_seen))
 
         self.is_initialized = True
 
@@ -563,6 +608,7 @@ class MambaSpecDecodeGPUContext:
             block_size=self.block_size,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+            TEMPORAL_COPY_BYTES=self.temporal_copy_bytes,
         )
 
 
