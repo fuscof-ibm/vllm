@@ -616,14 +616,25 @@ class MambaSpecDecodeGPUContext:
         if self.is_initialized:
             return
 
+        # Iterate state-type-major (all layers for state type 0, then all
+        # layers for state type 1, ...) rather than layer-major: contiguous
+        # program_id(1) values then do the same kind of copy, which keeps
+        # each SM's mix of fast (conv) vs slow (temporal) work uniform and
+        # shrinks the kernel's tail wave.
         idx = 0
         for group_local_idx, mamba_group_id in enumerate(self.mamba_group_ids):
             layer_names = kv_cache_config.kv_cache_groups[mamba_group_id].layer_names
-            for layer_name in layer_names:
-                attention = forward_context[layer_name]
-                kv_caches: list[torch.Tensor] = attention.kv_cache
+            for state_type_idx in range(self.num_state_types):
+                copy_func = mamba_state_copy_funcs[state_type_idx]
+                assert (
+                    copy_func is get_conv_copy_spec
+                    or copy_func is get_temporal_copy_spec
+                ), f"unexpected copy func: {copy_func}"
+                for layer_name in layer_names:
+                    attention = forward_context[layer_name]
+                    kv_caches: list[torch.Tensor] = attention.kv_cache
+                    state = kv_caches[state_type_idx]
 
-                for state_type_idx, state in enumerate(kv_caches):
                     # Base address
                     self.state_base_addrs[idx] = state.data_ptr()
 
@@ -640,11 +651,6 @@ class MambaSpecDecodeGPUContext:
                     # Element size
                     self.state_elem_sizes[idx] = state.element_size()
 
-                    copy_func = mamba_state_copy_funcs[state_type_idx]
-                    assert (
-                        copy_func is get_conv_copy_spec
-                        or copy_func is get_temporal_copy_spec
-                    ), f"unexpected copy func: {copy_func}"
                     if copy_func is get_conv_copy_spec:
                         if state.dim() != 3:
                             raise ValueError(
