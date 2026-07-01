@@ -690,6 +690,24 @@ class MambaSpecDecodeGPUContext:
                             state[0].numel() if state.dim() > 1 else 1
                         )
 
+                    # postprocess_mamba_fused_kernel vectorizes the
+                    # temporal / SD-conv copy with uint64 loads/stores;
+                    # per-token slice must be 8B-aligned. DS-conv keeps
+                    # the byte-wise loop and is exempt.
+                    is_ds_conv = (
+                        copy_func is get_conv_copy_spec and is_conv_state_dim_first()
+                    )
+                    if not is_ds_conv:
+                        slice_bytes = (
+                            int(self.state_inner_sizes[idx]) * state.element_size()
+                        )
+                        assert slice_bytes % 8 == 0, (
+                            f"layer {layer_name}: inner_size * elem_size "
+                            f"= {slice_bytes}B is not 8B-aligned; "
+                            f"postprocess_mamba_fused_kernel uint64 "
+                            f"vectorization requires it"
+                        )
+
                     self.state_group_indices[idx] = group_local_idx
                     idx += 1
 
