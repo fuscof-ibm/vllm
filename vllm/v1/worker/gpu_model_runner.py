@@ -1536,18 +1536,36 @@ class GPUModelRunner(
             # update without CPU-GPU sync. The metadata
             # (num_scheduled_tokens, num_draft_tokens, num_computed_tokens) is
             # pre-staged to GPU buffers in _prepare_inputs.
-            mamba_utils.postprocess_mamba_align_gpu(
-                bufs=self._get_mamba_bufs(),
-                num_reqs=num_reqs,
-                num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
-                num_accepted_tokens_cpu_tensor=(
-                    self.input_batch.num_accepted_tokens_cpu_tensor
-                ),
-                input_batch=self.input_batch,
-                kv_cache_config=self.kv_cache_config,
-                forward_context=self.compilation_config.static_forward_context,
-                mamba_state_copy_funcs=self.model.get_mamba_state_copy_func(),
-            )
+            bufs = self._get_mamba_bufs()
+            assert bufs.postprocess_align is not None
+            if mamba_utils.can_skip_mamba_postprocess(
+                scheduler_output,
+                self.input_batch,
+                self.requests,
+                bufs.postprocess_align.block_size,
+                num_reqs,
+            ):
+                # No request can cross a mamba block boundary this step, so
+                # the fused kernel would be a no-op. Skip the launch and the
+                # D->D init copy; just get num_accepted_tokens to CPU for
+                # next iter's preprocess. The event.synchronize() in
+                # _prepare_inputs absorbs the deferred wait.
+                self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                    self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+                )
+            else:
+                mamba_utils.postprocess_mamba_align_gpu(
+                    bufs=bufs,
+                    num_reqs=num_reqs,
+                    num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
+                    num_accepted_tokens_cpu_tensor=(
+                        self.input_batch.num_accepted_tokens_cpu_tensor
+                    ),
+                    input_batch=self.input_batch,
+                    kv_cache_config=self.kv_cache_config,
+                    forward_context=self.compilation_config.static_forward_context,
+                    mamba_state_copy_funcs=self.model.get_mamba_state_copy_func(),
+                )
 
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()

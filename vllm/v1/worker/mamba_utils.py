@@ -1062,6 +1062,40 @@ def preprocess_mamba_all_specdec(
     prev_last_scheduled_idx_buf.copy_to_gpu()
 
 
+def can_skip_mamba_postprocess(
+    scheduler_output: SchedulerOutput,
+    input_batch: GPUInputBatch,
+    requests: dict[str, CachedRequestState],
+    mamba_block_size: int,
+    num_reqs: int,
+) -> bool:
+    """Return True iff the fused align postprocess is provably a no-op.
+
+    ``num_accepted`` is bounded by ``n_draft + 1``, so we can decide on the
+    CPU whether any request can cross a mamba block boundary this step. If
+    none can, every thread of ``postprocess_mamba_fused_kernel`` would early
+    out at ``needs_copy = aligned_new_computed >= num_tokens_running_state``,
+    and the caller can skip the kernel launch entirely.
+
+    Must stay in lockstep with that predicate in the kernel.
+    """
+    if not mamba_block_size or mamba_block_size <= 0:
+        return False
+    num_scheduled = scheduler_output.num_scheduled_tokens
+    spec_decode = scheduler_output.scheduled_spec_decode_tokens
+    req_ids = input_batch.req_ids
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+        n_draft = len(spec_decode.get(req_id, ()))
+        n_running = (
+            requests[req_id].num_computed_tokens + num_scheduled[req_id] - n_draft
+        )
+        max_new = n_running + n_draft
+        if (max_new // mamba_block_size) * mamba_block_size >= n_running:
+            return False
+    return True
+
+
 def postprocess_mamba_align_gpu(
     *,
     bufs: "MambaBuffers",
