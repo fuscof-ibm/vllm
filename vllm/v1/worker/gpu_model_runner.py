@@ -1538,18 +1538,13 @@ class GPUModelRunner(
             # pre-staged to GPU buffers in _prepare_inputs.
             bufs = self._get_mamba_bufs()
             assert bufs.postprocess_align is not None
-            if mamba_utils.can_skip_mamba_postprocess(
-                scheduler_output,
-                self.input_batch,
-                self.requests,
-                bufs.postprocess_align.block_size,
-                num_reqs,
-            ):
-                # No request can cross a mamba block boundary this step, so
-                # the fused kernel would be a no-op. Skip the launch and the
-                # D->D init copy; just get num_accepted_tokens to CPU for
-                # next iter's preprocess. The event.synchronize() in
-                # _prepare_inputs absorbs the deferred wait.
+            if bufs.postprocess_align.skip_next_postprocess:
+                # stage_postprocess_inputs_to_gpu proved on the CPU that
+                # the fused kernel would be a no-op this step and skipped
+                # the four H→D staging copies. Skip the kernel launch (and
+                # its D→D init copy) too; just async D→H the accepted-token
+                # counts for the next iteration's preprocess. The
+                # event.synchronize() in _prepare_inputs absorbs the wait.
                 self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                     self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
                 )

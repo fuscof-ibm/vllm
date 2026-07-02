@@ -510,6 +510,13 @@ class MambaSpecDecodeGPUContext:
     # Flag to track if metadata has been populated
     is_initialized: bool = False
 
+    # Per-step flag: True iff ``stage_postprocess_inputs_to_gpu`` proved on
+    # the CPU that the fused postprocess kernel would be a no-op this step.
+    # When True, ``_update_states_after_model_execute`` skips the kernel
+    # launch (and its D→D init copy) and only issues the non-blocking D→H
+    # copy of ``num_accepted_tokens`` for the next iteration's preprocess.
+    skip_next_postprocess: bool = False
+
     @classmethod
     def create(
         cls,
@@ -1062,40 +1069,6 @@ def preprocess_mamba_all_specdec(
     prev_last_scheduled_idx_buf.copy_to_gpu()
 
 
-def can_skip_mamba_postprocess(
-    scheduler_output: SchedulerOutput,
-    input_batch: GPUInputBatch,
-    requests: dict[str, CachedRequestState],
-    mamba_block_size: int,
-    num_reqs: int,
-) -> bool:
-    """Return True iff the fused align postprocess is provably a no-op.
-
-    ``num_accepted`` is bounded by ``n_draft + 1``, so we can decide on the
-    CPU whether any request can cross a mamba block boundary this step. If
-    none can, every thread of ``postprocess_mamba_fused_kernel`` would early
-    out at ``needs_copy = aligned_new_computed >= num_tokens_running_state``,
-    and the caller can skip the kernel launch entirely.
-
-    Must stay in lockstep with that predicate in the kernel.
-    """
-    if not mamba_block_size or mamba_block_size <= 0:
-        return False
-    num_scheduled = scheduler_output.num_scheduled_tokens
-    spec_decode = scheduler_output.scheduled_spec_decode_tokens
-    req_ids = input_batch.req_ids
-    for i in range(num_reqs):
-        req_id = req_ids[i]
-        n_draft = len(spec_decode.get(req_id, ()))
-        n_running = (
-            requests[req_id].num_computed_tokens + num_scheduled[req_id] - n_draft
-        )
-        max_new = n_running + n_draft
-        if (max_new // mamba_block_size) * mamba_block_size >= n_running:
-            return False
-    return True
-
-
 def postprocess_mamba_align_gpu(
     *,
     bufs: "MambaBuffers",
@@ -1152,66 +1125,6 @@ def postprocess_mamba_align_gpu(
     )
 
 
-def stage_postprocess_metadata_to_gpu(
-    scheduler_output: SchedulerOutput,
-    req_ids: list[str],
-    num_reqs: int,
-    requests: dict[str, CachedRequestState],
-    num_scheduled_tokens_buf: CpuGpuBuffer,
-    num_computed_tokens_buf: CpuGpuBuffer,
-    num_draft_tokens_buf: CpuGpuBuffer,
-) -> None:
-    """Stage per-request postprocess metadata into GPU buffers (non-blocking).
-
-    Walks ``req_ids[:num_reqs]`` in batch order and writes each request's
-    scheduled/computed/draft token counts into the matching pinned numpy
-    views, then issues three non-blocking H→D copies. These values don't
-    change between ``_prepare_inputs`` and ``_update_states_after_model_execute``.
-    The fused postprocess kernel indexes the resulting GPU tensors
-    by ``req_idx``.
-    """
-    scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
-    num_scheduled = scheduler_output.num_scheduled_tokens
-    scheduled_np = num_scheduled_tokens_buf.np
-    computed_np = num_computed_tokens_buf.np
-    draft_np = num_draft_tokens_buf.np
-    for i in range(num_reqs):
-        req_id = req_ids[i]
-        scheduled_np[i] = num_scheduled[req_id]
-        computed_np[i] = requests[req_id].num_computed_tokens
-        draft_np[i] = len(scheduled_spec_tokens.get(req_id, []))
-    num_scheduled_tokens_buf.copy_to_gpu(num_reqs)
-    num_computed_tokens_buf.copy_to_gpu(num_reqs)
-    num_draft_tokens_buf.copy_to_gpu(num_reqs)
-
-
-def stage_mamba_state_idx_to_gpu(
-    mamba_state_idx: dict[str, int],
-    req_ids: list[str],
-    num_reqs: int,
-    gpu_buf: CpuGpuBuffer,
-) -> None:
-    """Materialize ``mamba_state_idx`` into ``gpu_buf`` and copy to GPU.
-
-    Walks ``req_ids[:num_reqs]`` in batch order, writing each request's block
-    index into the buffer's pinned numpy view, then issues a non-blocking H→D
-    copy. The fused kernel indexes the resulting GPU tensor by ``req_idx``.
-
-    Invariant: ``preprocess_mamba`` must have run first for the same batch so
-    that every ``req_ids[i]`` has an entry in ``mamba_state_idx``.
-    """
-    np_view = gpu_buf.np
-    for i in range(num_reqs):
-        req_id = req_ids[i]
-        state_idx = mamba_state_idx.get(req_id)
-        assert state_idx is not None, (
-            f"mamba_state_idx missing entry for {req_id!r}; "
-            "preprocess_mamba must run before stage_mamba_state_idx_to_gpu"
-        )
-        np_view[i] = state_idx
-    gpu_buf.copy_to_gpu(num_reqs)
-
-
 def stage_postprocess_inputs_to_gpu(
     ctx: MambaSpecDecodeGPUContext,
     scheduler_output: SchedulerOutput,
@@ -1220,29 +1133,66 @@ def stage_postprocess_inputs_to_gpu(
     requests: dict[str, CachedRequestState],
     mamba_state_idx: dict[str, int],
 ) -> None:
-    """Stage all per-request inputs the fused mamba postprocess kernel reads.
+    """Stage per-request inputs for the fused postprocess kernel.
 
-    Bundles ``stage_mamba_state_idx_to_gpu`` and
-    ``stage_postprocess_metadata_to_gpu`` into a single call so the runner
-    has one entry point for postprocess staging. Buffers live on ``ctx``
-    and only exist when the postprocess kernel is enabled.
+    Single pass over ``req_ids[:num_reqs]`` that fills the four staging
+    numpy views (mamba_state_idx / num_scheduled / num_computed /
+    num_draft) and *inline* decides whether the fused postprocess kernel
+    would be a no-op this step.
+
+    ``num_accepted`` is bounded by ``n_draft + 1`` on the CPU, so we can
+    tell if any request will cross a mamba block boundary before the
+    forward pass even runs. When no request can, the kernel would early
+    out at ``needs_copy = aligned_new_computed >= num_tokens_running_state``
+    for every thread, so we skip both the four H→D copies here and the
+    kernel launch (and its D→D init copy) in
+    ``postprocess_mamba_align_gpu``. Must stay in lockstep with that
+    predicate in ``postprocess_mamba_fused_kernel``.
+
+    The decision is recorded on ``ctx.skip_next_postprocess`` for
+    ``_update_states_after_model_execute`` to consume.
     """
     assert ctx.mamba_state_idx_buf is not None
     assert ctx.num_scheduled_tokens_buf is not None
     assert ctx.num_computed_tokens_buf is not None
     assert ctx.num_draft_tokens_buf is not None
-    stage_mamba_state_idx_to_gpu(
-        mamba_state_idx,
-        req_ids,
-        num_reqs,
-        ctx.mamba_state_idx_buf,
-    )
-    stage_postprocess_metadata_to_gpu(
-        scheduler_output,
-        req_ids,
-        num_reqs,
-        requests,
-        ctx.num_scheduled_tokens_buf,
-        ctx.num_computed_tokens_buf,
-        ctx.num_draft_tokens_buf,
-    )
+
+    state_idx_np = ctx.mamba_state_idx_buf.np
+    scheduled_np = ctx.num_scheduled_tokens_buf.np
+    computed_np = ctx.num_computed_tokens_buf.np
+    draft_np = ctx.num_draft_tokens_buf.np
+
+    scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+    num_scheduled = scheduler_output.num_scheduled_tokens
+    block_size = ctx.block_size
+    can_skip = block_size > 0
+
+    for i in range(num_reqs):
+        req_id = req_ids[i]
+
+        state_idx = mamba_state_idx.get(req_id)
+        assert state_idx is not None, (
+            f"mamba_state_idx missing entry for {req_id!r}; "
+            "preprocess_mamba must run before stage_postprocess_inputs_to_gpu"
+        )
+        state_idx_np[i] = state_idx
+
+        n_scheduled = num_scheduled[req_id]
+        n_computed = requests[req_id].num_computed_tokens
+        n_draft = len(scheduled_spec_tokens.get(req_id, []))
+        scheduled_np[i] = n_scheduled
+        computed_np[i] = n_computed
+        draft_np[i] = n_draft
+
+        if can_skip:
+            n_running = n_computed + n_scheduled - n_draft
+            max_new = n_running + n_draft
+            if (max_new // block_size) * block_size >= n_running:
+                can_skip = False
+
+    ctx.skip_next_postprocess = can_skip
+    if not can_skip:
+        ctx.mamba_state_idx_buf.copy_to_gpu(num_reqs)
+        ctx.num_scheduled_tokens_buf.copy_to_gpu(num_reqs)
+        ctx.num_computed_tokens_buf.copy_to_gpu(num_reqs)
+        ctx.num_draft_tokens_buf.copy_to_gpu(num_reqs)
