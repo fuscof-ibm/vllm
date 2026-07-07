@@ -109,16 +109,22 @@ def _copy_mamba_state_block(
         src_addr = state_base_addr + src_block_id * state_block_stride + src_offset
         num_elems_to_copy = (conv_width - token_bias).to(tl.int64) * state_inner_size
         copy_size = num_elems_to_copy * state_elem_size
-    else:
-        # Temporal state: copy state[bt[src_col + token_bias]] -> state[bt[dst_col]]
-        actual_src_block_id = tl.load(block_table_base + src_col + token_bias).to(
-            tl.int64
-        )
-        src_addr = state_base_addr + actual_src_block_id * state_block_stride
-        # Use natural block data size (inner_size * elem_size), NOT
-        # state_block_stride which is the page stride and can exceed the
-        # actual data when the state tensor uses as_strided page padding.
-        copy_size = state_inner_size * state_elem_size
+        offsets = tl.arange(0, COPY_BLOCK_SIZE)
+        for i in range(0, copy_size, COPY_BLOCK_SIZE):
+            mask = (i + offsets) < copy_size
+            curr_src = (src_addr + i + offsets).to(tl.pointer_type(tl.uint8))
+            curr_dst = (dst_addr + i + offsets).to(tl.pointer_type(tl.uint8))
+            data = tl.load(curr_src, mask=mask)
+            tl.store(curr_dst, data, mask=mask)
+        return
+
+    # Temporal state: copy state[bt[src_col + token_bias]] -> state[bt[dst_col]]
+    actual_src_block_id = tl.load(block_table_base + src_col + token_bias).to(tl.int64)
+    src_addr = state_base_addr + actual_src_block_id * state_block_stride
+    # Use natural block data size (inner_size * elem_size), NOT
+    # state_block_stride which is the page stride and can exceed the
+    # actual data when the state tensor uses as_strided page padding.
+    copy_size = state_inner_size * state_elem_size
 
     # Vectorize via uint64 (8B per thread → LDG.64/STG.64): both temporal
     # and SD conv produce src/dst addresses aligned to a full token slice
