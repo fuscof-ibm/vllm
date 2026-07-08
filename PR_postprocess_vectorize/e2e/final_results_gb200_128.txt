@@ -1,0 +1,337 @@
+
+```
+vllm serve \
+    --model Qwen/Qwen3.5-9B \
+    -tp 1 -pp 1 -dp 1 \
+    --language-model-only \
+    --reasoning-parser qwen3 \
+    --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}' \
+    --enable-prefix-caching
+```
+
+
+INPUT_LEN=500
+OUTPUT_LEN=5330
+NUM_PROMPTS=500
+
+# Warmup (discarded) then sweep concurrency.
+CONCURRENCIES=(1 4 8 16 32)
+
+run_one() {
+    local conc="$1"
+    vllm bench serve \
+        --dataset-name random \
+        --seed 42 \
+        --temperature 0 \
+        --random-input-len "$INPUT_LEN" \
+        --random-output-len "$OUTPUT_LEN" \
+        --num-prompts "$NUM_PROMPTS" \
+        --request-rate inf \
+        --max-concurrency "$conc" \
+        --ignore-eos \
+        --percentile-metrics "ttft,tpot,itl,e2el" \
+        --metric-percentiles "50,90,99"
+}
+
+# One warmup at low concurrency to populate caches / JIT Triton.
+
+run_one 128 
+run_one 128
+run_one 128
+run_one 128
+run_one 128
+run_one 128
+
+
+results last_precompiled (4e5ca89cfe98121642d76b40e32a006f4d0fbf3b)
+
+
+============ Serving Benchmark Result ============
+Successful requests:                     500       
+Failed requests:                         0         
+Maximum request concurrency:             128       
+Benchmark duration (s):                  177.15    
+Total input tokens:                      250000    
+Total generated tokens:                  2665000   
+Request throughput (req/s):              2.82      
+Output token throughput (tok/s):         15043.43  
+Peak output token throughput (tok/s):    6144.00   
+Peak concurrent requests:                199.00    
+Total token throughput (tok/s):          16454.64  
+---------------Time to First Token----------------
+Mean TTFT (ms):                          775.49    
+Median TTFT (ms):                        456.13    
+P50 TTFT (ms):                           456.13    
+P90 TTFT (ms):                           2005.37   
+P99 TTFT (ms):                           2318.36   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          8.07      
+Median TPOT (ms):                        8.13      
+P50 TPOT (ms):                           8.13      
+P90 TPOT (ms):                           8.43      
+P99 TPOT (ms):                           9.58      
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           24.00     
+Median ITL (ms):                         22.88     
+P50 ITL (ms):                            22.88     
+P90 ITL (ms):                            27.27     
+P99 ITL (ms):                            88.28     
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          43801.91  
+Median E2EL (ms):                        43733.26  
+P50 E2EL (ms):                           43733.26  
+P90 E2EL (ms):                           45337.50  
+P99 E2EL (ms):                           51507.32  
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     98.65     
+Acceptance length:                       2.97      
+Drafts:                                  896424    
+Draft tokens:                            1792848   
+Accepted tokens:                         1768615   
+Per-position acceptance (%):
+  Position 0:                            99.30     
+  Position 1:                            97.99     
+==================================================
+
+
+============ Serving Benchmark Result ============
+Successful requests:                     500       
+Failed requests:                         0         
+Maximum request concurrency:             128       
+Benchmark duration (s):                  176.66    
+Total input tokens:                      250000    
+Total generated tokens:                  2665000   
+Request throughput (req/s):              2.83      
+Output token throughput (tok/s):         15085.43  
+Peak output token throughput (tok/s):    6144.00   
+Peak concurrent requests:                210.00    
+Total token throughput (tok/s):          16500.57  
+---------------Time to First Token----------------
+Mean TTFT (ms):                          569.00    
+Median TTFT (ms):                        463.78    
+P50 TTFT (ms):                           463.78    
+P90 TTFT (ms):                           1153.97   
+P99 TTFT (ms):                           1418.85   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          8.13      
+Median TPOT (ms):                        8.16      
+P50 TPOT (ms):                           8.16      
+P90 TPOT (ms):                           8.50      
+P99 TPOT (ms):                           9.76      
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           24.07     
+Median ITL (ms):                         22.97     
+P50 ITL (ms):                            22.97     
+P90 ITL (ms):                            27.34     
+P99 ITL (ms):                            89.22     
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          43884.67  
+Median E2EL (ms):                        43801.86  
+P50 E2EL (ms):                           43801.86  
+P90 E2EL (ms):                           45759.76  
+P99 E2EL (ms):                           52540.81  
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     98.11     
+Acceptance length:                       2.96      
+Drafts:                                  899691    
+Draft tokens:                            1799382   
+Accepted tokens:                         1765356   
+Per-position acceptance (%):
+  Position 0:                            98.99     
+  Position 1:                            97.23     
+==================================================
+
+
+============ Serving Benchmark Result ============
+Successful requests:                     500       
+Failed requests:                         0         
+Maximum request concurrency:             128       
+Benchmark duration (s):                  174.70    
+Total input tokens:                      250000    
+Total generated tokens:                  2665000   
+Request throughput (req/s):              2.86      
+Output token throughput (tok/s):         15254.31  
+Peak output token throughput (tok/s):    6247.00   
+Peak concurrent requests:                200.00    
+Total token throughput (tok/s):          16685.30  
+---------------Time to First Token----------------
+Mean TTFT (ms):                          620.01    
+Median TTFT (ms):                        508.82    
+P50 TTFT (ms):                           508.82    
+P90 TTFT (ms):                           1175.23   
+P99 TTFT (ms):                           1424.61   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          8.02      
+Median TPOT (ms):                        8.01      
+P50 TPOT (ms):                           8.01      
+P90 TPOT (ms):                           8.38      
+P99 TPOT (ms):                           9.43      
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           23.84     
+Median ITL (ms):                         22.85     
+P50 ITL (ms):                            22.85     
+P90 ITL (ms):                            27.24     
+P99 ITL (ms):                            86.79     
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          43357.67  
+Median E2EL (ms):                        43313.90  
+P50 E2EL (ms):                           43313.90  
+P90 E2EL (ms):                           45046.41  
+P99 E2EL (ms):                           50868.98  
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     98.63     
+Acceptance length:                       2.97      
+Drafts:                                  896520    
+Draft tokens:                            1793040   
+Accepted tokens:                         1768516   
+Per-position acceptance (%):
+  Position 0:                            99.30     
+  Position 1:                            97.96     
+==================================================
+
+
+results postprocess_vectorize (4575b6f2321d69c9b41ce286f4d520ea52bd3857)
+
+
+
+============ Serving Benchmark Result ============
+Successful requests:                     500       
+Failed requests:                         0         
+Maximum request concurrency:             128       
+Benchmark duration (s):                  173.35    
+Total input tokens:                      250000    
+Total generated tokens:                  2665000   
+Request throughput (req/s):              2.88      
+Output token throughput (tok/s):         15373.31  
+Peak output token throughput (tok/s):    6144.00   
+Peak concurrent requests:                190.00    
+Total token throughput (tok/s):          16815.46  
+---------------Time to First Token----------------
+Mean TTFT (ms):                          607.70    
+Median TTFT (ms):                        492.03    
+P50 TTFT (ms):                           492.03    
+P90 TTFT (ms):                           1159.56   
+P99 TTFT (ms):                           1424.45   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          7.97      
+Median TPOT (ms):                        7.99      
+P50 TPOT (ms):                           7.99      
+P90 TPOT (ms):                           8.32      
+P99 TPOT (ms):                           9.35      
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           23.69     
+Median ITL (ms):                         22.66     
+P50 ITL (ms):                            22.66     
+P90 ITL (ms):                            26.90     
+P99 ITL (ms):                            87.95     
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          43055.94  
+Median E2EL (ms):                        43137.56  
+P50 E2EL (ms):                           43137.56  
+P90 E2EL (ms):                           44609.09  
+P99 E2EL (ms):                           50372.63  
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     98.75     
+Acceptance length:                       2.98      
+Drafts:                                  895809    
+Draft tokens:                            1791618   
+Accepted tokens:                         1769235   
+Per-position acceptance (%):
+  Position 0:                            99.34     
+  Position 1:                            98.16     
+==================================================
+
+
+============ Serving Benchmark Result ============
+Successful requests:                     500       
+Failed requests:                         0         
+Maximum request concurrency:             128       
+Benchmark duration (s):                  174.18    
+Total input tokens:                      250000    
+Total generated tokens:                  2665000   
+Request throughput (req/s):              2.87      
+Output token throughput (tok/s):         15300.66  
+Peak output token throughput (tok/s):    6144.00   
+Peak concurrent requests:                192.00    
+Total token throughput (tok/s):          16736.00  
+---------------Time to First Token----------------
+Mean TTFT (ms):                          576.16    
+Median TTFT (ms):                        452.44    
+P50 TTFT (ms):                           452.44    
+P90 TTFT (ms):                           1202.14   
+P99 TTFT (ms):                           1457.65   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          7.99      
+Median TPOT (ms):                        8.03      
+P50 TPOT (ms):                           8.03      
+P90 TPOT (ms):                           8.37      
+P99 TPOT (ms):                           9.42      
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           23.76     
+Median ITL (ms):                         22.74     
+P50 ITL (ms):                            22.74     
+P90 ITL (ms):                            27.04     
+P99 ITL (ms):                            86.90     
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          43170.79  
+Median E2EL (ms):                        43178.65  
+P50 E2EL (ms):                           43178.65  
+P90 E2EL (ms):                           45003.53  
+P99 E2EL (ms):                           50701.98  
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     98.63     
+Acceptance length:                       2.97      
+Drafts:                                  896526    
+Draft tokens:                            1793052   
+Accepted tokens:                         1768525   
+Per-position acceptance (%):
+  Position 0:                            99.27     
+  Position 1:                            98.00     
+==================================================
+
+============ Serving Benchmark Result ============
+Successful requests:                     500       
+Failed requests:                         0         
+Maximum request concurrency:             128       
+Benchmark duration (s):                  173.27    
+Total input tokens:                      250000    
+Total generated tokens:                  2665000   
+Request throughput (req/s):              2.89      
+Output token throughput (tok/s):         15380.40  
+Peak output token throughput (tok/s):    6367.00   
+Peak concurrent requests:                190.00    
+Total token throughput (tok/s):          16823.21  
+---------------Time to First Token----------------
+Mean TTFT (ms):                          563.70    
+Median TTFT (ms):                        457.14    
+P50 TTFT (ms):                           457.14    
+P90 TTFT (ms):                           1165.55   
+P99 TTFT (ms):                           1412.91   
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          7.95      
+Median TPOT (ms):                        7.96      
+P50 TPOT (ms):                           7.96      
+P90 TPOT (ms):                           8.31      
+P99 TPOT (ms):                           9.44      
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           23.64     
+Median ITL (ms):                         22.65     
+P50 ITL (ms):                            22.65     
+P90 ITL (ms):                            27.00     
+P99 ITL (ms):                            88.39     
+----------------End-to-end Latency----------------
+Mean E2EL (ms):                          42938.06  
+Median E2EL (ms):                        42855.56  
+P50 E2EL (ms):                           42855.56  
+P90 E2EL (ms):                           44630.71  
+P99 E2EL (ms):                           50723.61  
+---------------Speculative Decoding---------------
+Acceptance rate (%):                     98.66     
+Acceptance length:                       2.97      
+Drafts:                                  896334    
+Draft tokens:                            1792668   
+Accepted tokens:                         1768702   
+Per-position acceptance (%):
+  Position 0:                            99.27     
+  Position 1:                            98.06     
+==================================================
