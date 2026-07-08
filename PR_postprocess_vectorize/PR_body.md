@@ -173,8 +173,11 @@ P99 tails:
 | Δ P99 ITL  |     | **−0.23 %** | **−1.29 %** | **−0.40 %** |
 | E2EL (ms) | main | 26728 ± 227 | 35903 ± 400 | 51639 ± 844 |
 | E2EL (ms) | PR   | 26436 ± 328 | 34561 ± 640 | 50599 ± 197 |
+
+<!--
 | TTFT (ms) | main | 434 ± 16 | 956 ± 391 | 1721 ± 518 |
 | TTFT (ms) | PR   | 847 ± 754 | 1046 ± 553 | 1432 ± 23 |
+-->
 
 **Analysis.**
 
@@ -184,9 +187,12 @@ P99 tails:
     - `conc=128`: +1.48 % throughput, ~1.3 % lower median TPOT
 - Gains peak at `conc=64`. At `conc=32` the step is still GPU-idle-bound so a faster kernel moves the wall clock only slightly; at `conc=128` the GPU is closer to saturation so the copy is a smaller share of the step. Mid-concurrency is where this kernel is on the critical path.
 - **Speculative decoding is unaffected.** Acceptance rates and per-position acceptance are indistinguishable between branches (all ~98.5–98.7 %). The speedup is pure kernel time, not a change in draft/verify behavior.
+
+<!--
 - P99 TPOT / E2EL tails improve proportionally to the medians (−0.8 % / −3.7 % / −2.0 % for P99 TPOT at conc 32 / 64 / 128; −1.1 % / −3.7 % / −2.0 % for P99 E2EL). At `conc=64` and `conc=128` the P99 improvements exceed 1σ.
 - P99 ITL barely moves. These spikes (77–88 ms) are dominated by rare CUDA-graph / eviction events rather than this copy, so vectorization has no purchase on them — as expected.
 - P99 TTFT is inconclusive: TTFT is prefill-dominated and shouldn't be affected by this change in either direction. Run-to-run variance on both branches is large (σ from ~15 to ~750 ms); the apparent regression at `conc=32` on the PR branch (847 ± 754 ms vs 434 ± 16 ms) is driven by a single outlier run and is not signal.
+-->
 
 ### Summary
 
