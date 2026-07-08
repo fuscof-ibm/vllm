@@ -74,8 +74,8 @@ DST_COL = 1
 TOKEN_BIAS = 0
 
 COPY_BLOCK_SIZE = 1024
-ITERS_WARMUP = 20
-ITERS_TIMED = 200
+DEFAULT_ITERS_WARMUP = 20
+DEFAULT_ITERS_TIMED = 200
 
 
 @triton.jit
@@ -220,7 +220,12 @@ def bytes_moved_per_launch(state_tensors, is_conv_list, conv_state_dim_first: bo
     return per_req
 
 
-def bench_one(num_reqs: int, conv_state_dim_first: bool) -> float:
+def bench_one(
+    num_reqs: int,
+    conv_state_dim_first: bool,
+    iters_warmup: int,
+    iters_timed: int,
+) -> float:
     # Give every request distinct src/dst block ids so concurrent copies don't
     # share cache lines. State tensors hold at least 2*num_reqs blocks.
     num_blocks = 2 * num_reqs
@@ -273,7 +278,7 @@ def bench_one(num_reqs: int, conv_state_dim_first: bool) -> float:
             CONV_STATE_DIM_FIRST=conv_state_dim_first,
         )
 
-    for _ in range(ITERS_WARMUP):
+    for _ in range(iters_warmup):
         launch()
     torch.cuda.synchronize()
 
@@ -285,13 +290,13 @@ def bench_one(num_reqs: int, conv_state_dim_first: bool) -> float:
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
-    for _ in range(ITERS_TIMED):
+    for _ in range(iters_timed):
         launch()
     end.record()
     torch.cuda.synchronize()
     nvtx.range_pop()
 
-    avg_us = start.elapsed_time(end) * 1000.0 / ITERS_TIMED
+    avg_us = start.elapsed_time(end) * 1000.0 / iters_timed
     bytes_per_req = bytes_moved_per_launch(
         state_tensors, is_conv_list, conv_state_dim_first
     )
@@ -321,6 +326,21 @@ def main():
         default="SD",
         help="Conv state layout to benchmark. Real Qwen3.5-9B is SD.",
     )
+    parser.add_argument(
+        "--iters-warmup",
+        type=int,
+        default=DEFAULT_ITERS_WARMUP,
+        help="Warmup launches before the timed loop.",
+    )
+    parser.add_argument(
+        "--iters-timed",
+        type=int,
+        default=DEFAULT_ITERS_TIMED,
+        help=(
+            "Timed launches inside the NVTX range. Drop to 1 when profiling "
+            "with `ncu --launch-count N` so each NVTX range yields one launch."
+        ),
+    )
     args = parser.parse_args()
 
     assert torch.cuda.is_available(), "CUDA required"
@@ -333,7 +353,7 @@ def main():
         f"(={CONV_DIM * CONV_STATE_LEN * ELEM_SIZE / 1024:.1f} KiB/block)\n"
         f"temporal: inner={TEMPORAL_INNER} "
         f"(={TEMPORAL_INNER * ELEM_SIZE / 1024 / 1024:.2f} MiB/block)\n"
-        f"iters warmup={ITERS_WARMUP} timed={ITERS_TIMED}"
+        f"iters warmup={args.iters_warmup} timed={args.iters_timed}"
     )
     print()
 
@@ -347,7 +367,7 @@ def main():
     t0 = time.perf_counter()
     for conv_ds in layouts:
         for nr in args.concurrencies:
-            bench_one(nr, conv_ds)
+            bench_one(nr, conv_ds, args.iters_warmup, args.iters_timed)
     torch.cuda.cudart().cudaProfilerStop()
     print(f"\ntotal wall: {time.perf_counter() - t0:.2f}s")
 
