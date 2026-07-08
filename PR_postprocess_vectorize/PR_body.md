@@ -2,17 +2,23 @@
 
 ## Purpose
 
-`_copy_mamba_state_block` copies temporal and conv states with 1-byte loads and stores, leaving most of the HBM bandwidth on the floor. Temporal states are 20–30× the size of the conv states depending on the model, so the copy is dominated by the temporal path.
+PR [#40172](https://github.com/vllm-project/vllm/pull/40172) introduced the [
+postprocess_mamba_fused_kernel](https://github.com/vllm-project/vllm/blob/0d12618e98ff2d21d36081e0e9b4eb23573b6d38/vllm/v1/worker/mamba_utils.py#L133) in MRV1 to copy states in hybrid models when prefix caching is enabled in align mode (and under MTP). Every accepted draft step that crosses a block boundary triggers a full sweep of `(num_reqs × total_states)` block copies — for Qwen/Qwen3.5-9B that's 24 linear-attention layers × (conv + temporal) = 48 state copies per accepted step, ~1 MiB temporal + ~80 KiB conv per block.
 
-This PR switches the temporal-state copy to `uint64` loads/stores (8× wider transactions per instruction). To make every issued address safe, `MambaSpecDecodeGPUContext` now asserts at setup that the temporal-state base pointer and per-block stride are both 8-byte aligned; if either fails, we fall back to the existing 1-byte path rather than issuing misaligned wide accesses.
+A later PR [#42406](https://github.com/vllm-project/vllm/pull/42406) refactored the kernel to reuse the copy mechanism, now delegated to the [_copy_mamba_state_block](https://github.com/vllm-project/vllm/blob/0d12618e98ff2d21d36081e0e9b4eb23573b6d38/vllm/v1/worker/mamba_utils.py#L27) to support align mode prefix cashing in MRV2.
 
-Net effect: the kernel is now HBM-bandwidth-bound instead of instruction-issue-bound, and the per-decode-step latency contributed by this copy drops by ~5–6× in the small-batch regime that matters most for serving.
+The current copy body issues **1-byte loads and stores**. Temporal states are 20–30× the size of conv states and are contiguous, so the temporal path dominates and leaves most HBM bandwidth on the floor: the kernel tops out at ~63 % of HBM3 peak on H100 and ~32 % of HBM3e peak on GB200 — instruction-issue-/launch-bound rather than bandwidth-bound.
+
+This PR switches the temporal-state copy to **`uint64` loads/stores** (8× wider transactions per instruction). To make every issued address safe by construction, `MambaSpecDecodeGPUContext` now asserts at setup that the temporal-state base pointer and per-block stride are both 8-byte aligned; bf16/fp16 temporal states with contiguous inner dims satisfy this trivially, so the assert is a cheap guardrail rather than a fallback path. The conv path is untouched.
+
+Net effect: the kernel becomes HBM-bandwidth-bound (~75–84 % of peak from `reqs=16` onward on H100/GB200) and the decode-regime latency (`reqs=1–8`) drops ~5.7–5.8× on both H100 and GB200.
+End-to-end on GB200 with MTP this shows up as **+0.75 % / +2.97 % / +1.48 %** output throughput and correspondingly lower median and P99 TPOT/E2EL at concurrencies 32 / 64 / 128, with MTP acceptance unchanged.
 
 ## Test Plan
 
 ### Microbenchmark
 
-Developed a microbenchmark harness `benchmarks/bench_copy_mamba_state_block.py`,
+Developed a microbenchmark harness [bench_copy_mamba_state_block.py](https://github.com/fuscof-ibm/vllm/blob/postprocess_benchmark/bench_copy_mamba_state_block.py),
 which isolates `_copy_mamba_state_block` behind a minimal Triton wrapper launched at
 the production grid (num_reqs, 48) using Qwen/Qwen3.5-9B's real state layout
 (24 linear layers × conv+temporal, tp=1, num_spec=2),
@@ -67,7 +73,7 @@ Hardware: NVIDIA GB200. Concurrency sweep `{32, 64, 128}`. At each concurrency w
 Branches compared:
 
 - `main` — `4e5ca89cfe98121642d76b40e32a006f4d0fbf3b`
-- `postprocess_vectorize` — `4575b6f2321d69c9b41ce286f4d520ea52bd3857`
+- `postprocess_vectorize` — `d7544920e7c8ee1e59e66f4ce113720b02fedd0b`
 
 ## Test Result
 
