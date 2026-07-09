@@ -7,11 +7,11 @@ postprocess_mamba_fused_kernel](https://github.com/vllm-project/vllm/blob/0d1261
 
 A later PR [#42406](https://github.com/vllm-project/vllm/pull/42406) refactored the kernel to reuse the copy mechanism, now delegated to the [_copy_mamba_state_block](https://github.com/vllm-project/vllm/blob/0d12618e98ff2d21d36081e0e9b4eb23573b6d38/vllm/v1/worker/mamba_utils.py#L27) to support align mode prefix cashing in MRV2.
 
-The current copy body issues **1-byte loads and stores**. Temporal states are 20–30× the size of conv states and are contiguous, so the temporal path dominates and leaves most HBM bandwidth on the floor: the kernel tops out at ~63 % of HBM3 peak on H100 and ~32 % of HBM3e peak on GB200 — instruction-issue-/launch-bound rather than bandwidth-bound.
+The current copy body issues **1-byte loads and stores**. Temporal states are 20–30× the size of conv states and are contiguous, so the temporal path dominates and leaves most HBM bandwidth on the floor: the kernel tops out at ~62 % of HBM3 peak on H100 and ~33 % of HBM3e peak on GB200 — instruction-issue-/launch-bound rather than bandwidth-bound.
 
-This PR switches the temporal-state copy to **`uint64` loads/stores** (8× wider transactions per instruction). To make every issued address safe by construction, `MambaSpecDecodeGPUContext` now asserts at setup that the temporal-state base pointer and per-block stride are both 8-byte aligned; bf16/fp16 temporal states with contiguous inner dims satisfy this trivially, so the assert is a cheap guardrail rather than a fallback path. The conv path is untouched.
+This PR switches the temporal-state copy to **`uint64` loads/stores** (8× wider transactions per instruction). To make every issued address safe by construction, `MambaSpecDecodeGPUContext` now asserts at setup that the temporal-state base pointer and per-block stride are both 8-byte aligned; bf16/fp16/fp32 temporal states with contiguous inner dims satisfy this trivially, so the assert is a cheap guardrail rather than a fallback path. The conv path is untouched.
 
-Net effect: the kernel becomes HBM-bandwidth-bound (~75–84 % of peak from `reqs=16` onward on H100/GB200) and the decode-regime latency (`reqs=1–8`) drops ~5.7–5.8× on both H100 and GB200.
+Net effect: the kernel becomes HBM-bandwidth-bound (~74–84 % of peak from `reqs=16` onward on H100/GB200) and the decode-regime latency (`reqs=1–8`) drops ~5.9–6.5× on both H100 and GB200.
 End-to-end on GB200 with MTP this shows up as **+0.75 % / +2.97 % / +1.48 %** output throughput and correspondingly lower median and P99 TPOT/E2EL at concurrencies 32 / 64 / 128, with MTP acceptance unchanged.
 
 ## Test Plan
@@ -24,7 +24,7 @@ the production grid (num_reqs, 48) using Qwen/Qwen3.5-9B's real state layout
 (24 linear layers × conv+temporal, tp=1, num_spec=2),
 with each request assigned distinct src/dst block ids so L2 can't mask DRAM traffic.
 
-Each request corresponds to 25.88 MiB of copies: 24 temporal and 24 SD conv.
+Each request corresponds to 49.88 MiB of copies: 24 temporal (float32) and 24 SD conv (bfloat16).
 
 We sweep the num_req to `{1, 4, 8, 16, 32, 64, 128}` using two GPU architectures:
 
@@ -83,29 +83,29 @@ Branches compared:
 
 | reqs | MAIN (GB/s) | PR (GB/s) | Gain | MAIN % peak | PR % peak |
 |-----:|------------:|----------:|-----:|------------:|----------:|
-| 1    | 110.3       | 642.2     | **5.82×** | 3.3%   | 19.2% |
-| 4    | 400.6       | 1847.4    | **4.61×** | 12.0%  | 55.1% |
-| 8    | 737.1       | 2430.9    | **3.30×** | 22.0%  | 72.6% |
-| 16   | 1296.2      | 2741.0    | **2.11×** | 38.7%  | **81.8%** |
-| 32   | 1925.4      | 2717.6    | **1.41×** | 57.5%  | **81.1%** |
-| 64   | 1898.1      | 2784.1    | **1.47×** | 56.7%  | **83.1%** |
-| 128  | 2112.5      | 2824.1    | **1.34×** | 63.1%  | **84.3%** |
+| 1    | 108.6       | 641.0     | **5.90×** | 3.2%   | 19.1% |
+| 4    | 388.9       | 1846.5    | **4.75×** | 11.6%  | 55.1% |
+| 8    | 712.3       | 2472.6    | **3.47×** | 21.3%  | 73.8% |
+| 16   | 1260.7      | 2799.2    | **2.22×** | 37.6%  | **83.6%** |
+| 32   | 1901.1      | 2739.3    | **1.44×** | 56.7%  | **81.8%** |
+| 64   | 1852.3      | 2800.8    | **1.51×** | 55.3%  | **83.6%** |
+| 128  | 2086.3      | 2822.9    | **1.35×** | 62.3%  | **84.3%** |
 
-PR saturates HBM from `reqs≥16` (~81–84% of peak). MAIN never exceeds 63% of peak — launch/serialization-bound.
+PR saturates HBM from `reqs≥16` (~82–84% of peak). MAIN caps at 62% of peak — launch/serialization-bound.
 
 **GB200 (HBM3e, ~8 TB/s peak):**
 
 | reqs | MAIN (GB/s) | PR (GB/s) | Gain | MAIN % peak | PR % peak |
 |-----:|------------:|----------:|-----:|------------:|----------:|
-| 1    | 148.5       | 850.2     | **5.72×** | 1.9%   | 10.6% |
-| 4    | 291.9       | 1671.9    | **5.73×** | 3.6%   | 20.9% |
-| 8    | 570.1       | 3070.8    | **5.39×** | 7.1%   | 38.4% |
-| 16   | 1055.9      | 4714.9    | **4.47×** | 13.2%  | 58.9% |
-| 32   | 1760.0      | 5818.1    | **3.31×** | 22.0%  | 72.7% |
-| 64   | 2098.4      | 5496.3    | **2.62×** | 26.2%  | 68.7% |
-| 128  | 2583.6      | 6022.2    | **2.33×** | 32.3%  | **75.3%** |
+| 1    | 73.8        | 479.4     | **6.50×** | 0.9%   | 6.0%  |
+| 4    | 280.1       | 1640.6    | **5.86×** | 3.5%   | 20.5% |
+| 8    | 547.9       | 3050.0    | **5.57×** | 6.8%   | 38.1% |
+| 16   | 1019.2      | 4737.9    | **4.65×** | 12.7%  | 59.2% |
+| 32   | 1730.0      | 5900.6    | **3.41×** | 21.6%  | **73.8%** |
+| 64   | 2065.9      | 5165.9    | **2.50×** | 25.8%  | 64.6% |
+| 128  | 2606.3      | 5788.0    | **2.22×** | 32.6%  | 72.4% |
 
-PR reaches ~75% of peak at `reqs=128` and is still climbing. MAIN caps at 32% of peak — same overhead ceiling as H100.
+PR reaches ~74% of peak at `reqs=32` and still has headroom. MAIN caps at 33% of peak — same overhead ceiling as H100.
 
 ### Microbenchmark — kernel latency
 
@@ -113,35 +113,35 @@ PR reaches ~75% of peak at `reqs=128` and is still climbing. MAIN caps at 32% of
 
 | reqs | MAIN | PR | Speedup | Absolute saving |
 |-----:|-----:|---:|--------:|----------------:|
-| 1    | 491.97  | 84.50   | **5.82×** | −407.5 µs |
-| 4    | 541.85  | 117.49  | **4.61×** | −424.4 µs |
-| 8    | 588.92  | 178.58  | **3.30×** | −410.3 µs |
-| 16   | 669.82  | 316.76  | **2.11×** | −353.1 µs |
-| 32   | 901.88  | 638.97  | **1.41×** | −262.9 µs |
-| 64   | 1829.67 | 1247.38 | **1.47×** | −582.3 µs |
-| 128  | 3288.01 | 2459.43 | **1.34×** | −828.6 µs |
+| 1    | 963.25  | 163.18  | **5.90×** | −800.1 µs |
+| 4    | 1075.78 | 226.58  | **4.75×** | −849.2 µs |
+| 8    | 1174.75 | 338.41  | **3.47×** | −836.3 µs |
+| 16   | 1327.50 | 597.85  | **2.22×** | −729.7 µs |
+| 32   | 1760.57 | 1221.86 | **1.44×** | −538.7 µs |
+| 64   | 3613.88 | 2390.06 | **1.51×** | −1223.8 µs |
+| 128  | 6417.25 | 4742.66 | **1.35×** | −1674.6 µs |
 
-Total wall across the sweep: **2.24 s → 1.52 s (−32%)**. A near-constant ~400 µs saving at low `reqs` (fixed overhead removed), growing again at `reqs≥64` as the workload becomes bandwidth-heavy.
+Total wall across the sweep: **4.38 s → 3.00 s (−32%)**. A near-constant ~800 µs saving at low `reqs` (fixed overhead removed), growing to ~1.7 ms at `reqs=128` as the workload becomes bandwidth-heavy.
 
 **GB200 (avg kernel latency, µs):**
 
 | reqs | MAIN | PR | Speedup | Absolute saving |
 |-----:|-----:|---:|--------:|----------------:|
-| 1    | 365.31  | 63.82   | **5.72×** | −301.5 µs |
-| 4    | 743.50  | 129.82  | **5.73×** | −613.7 µs |
-| 8    | 761.45  | 141.37  | **5.39×** | −620.1 µs |
-| 16   | 822.26  | 184.14  | **4.47×** | −638.1 µs |
-| 32   | 986.63  | 298.45  | **3.31×** | −688.2 µs |
-| 64   | 1654.98 | 631.86  | **2.62×** | −1023.1 µs |
-| 128  | 2688.44 | 1153.36 | **2.33×** | −1535.1 µs |
+| 1    | 1417.62 | 218.20  | **6.50×** | −1199.4 µs |
+| 4    | 1493.72 | 255.02  | **5.86×** | −1238.7 µs |
+| 8    | 1527.27 | 274.35  | **5.57×** | −1252.9 µs |
+| 16   | 1642.00 | 353.22  | **4.65×** | −1288.8 µs |
+| 32   | 1934.67 | 567.24  | **3.41×** | −1367.4 µs |
+| 64   | 3240.21 | 1295.81 | **2.50×** | −1944.4 µs |
+| 128  | 5136.81 | 2313.11 | **2.22×** | −2823.7 µs |
 
-Absolute saving grows monotonically with `reqs` (301 → 1535 µs) because HBM3e headroom lets the vectorized path keep scaling.
+Total wall across the sweep: **4.50 s → 1.64 s (−63.6%)**. Absolute saving grows monotonically with `reqs` (1.20 → 2.82 ms) because HBM3e headroom lets the vectorized path keep scaling.
 
 **Cross-platform takeaways:**
 
-- Low-`reqs` uplift is **~5.7–5.8× on both GPUs** — the decode-step regime where mamba state-copy latency dominates per-token time.
-- PR speedup shrinks with batch size on H100 because it hits HBM; on GB200 it shrinks more slowly because HBM3e still has slack at `reqs=128`.
-- Decode regime (`reqs=1–8`): sub-200 µs on PR vs 0.36–0.76 ms on MAIN.
+- Low-`reqs` uplift is **~5.9–6.5× on both GPUs** — the decode-step regime where mamba state-copy latency dominates per-token time.
+- PR saturates H100 HBM at `reqs≥16` (~84% peak); on GB200 it reaches ~74% at `reqs=32` and still has slack.
+- Decode regime (`reqs=1–8`): sub-350 µs on PR vs 0.96–1.53 ms on MAIN.
 
 ### End-to-end serving (GB200)
 
@@ -195,7 +195,7 @@ P99 tails:
 
 ### Summary
 
-`_copy_mamba_state_block` goes from ~3–32 % of HBM peak (launch-bound) to ~75–84 % of HBM peak (bandwidth-bound) with a **~5.7–5.8× decode-regime speedup** on both H100 and GB200. End-to-end on GB200 with MTP speculative decoding this shows up as **+0.75 % / +2.97 % / +1.48 %** output throughput and correspondingly lower median and P99 TPOT/E2EL at concurrencies 32 / 64 / 128. Metrics outside the change's blast radius (ITL spikes, TTFT tails, MTP acceptance) are unaffected as expected.
+`_copy_mamba_state_block` goes from ~3–33 % of HBM peak (launch-bound) to ~74–84 % of HBM peak (bandwidth-bound) with a **~5.9–6.5× decode-regime speedup** on both H100 and GB200. End-to-end on GB200 with MTP speculative decoding this shows up as **+0.75 % / +2.97 % / +1.48 %** output throughput and correspondingly lower median and P99 TPOT/E2EL at concurrencies 32 / 64 / 128. Metrics outside the change's blast radius (ITL spikes, TTFT tails, MTP acceptance) are unaffected as expected.
 
 ---
 <details>
