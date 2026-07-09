@@ -1,18 +1,17 @@
-<!-- markdownlint-disable -->
+## Purpos.
 
-## Purpose
+PR [#40172](https://github.com/vllm-project/vllm/pull/40172) introduced the [postprocess_mamba_fused_kernel](https://github.com/vllm-project/vllm/blob/0d12618e98ff2d21d36081e0e9b4eb23573b6d38/vllm/v1/worker/mamba_utils.py#L133) in MRV1 to copy states in hybrid models when prefix caching is enabled in align mode (and under MTP). Every accepted draft step that crosses a block boundary triggers a full sweep of `(num_reqs × total_states)` block copies — for Qwen/Qwen3.5-9B that's 24 linear-attention layers × (conv + temporal) = 48 state copies per accepted step, ~2 MiB temporal + ~80 KiB conv per block.
 
-PR [#40172](https://github.com/vllm-project/vllm/pull/40172) introduced the [
-postprocess_mamba_fused_kernel](https://github.com/vllm-project/vllm/blob/0d12618e98ff2d21d36081e0e9b4eb23573b6d38/vllm/v1/worker/mamba_utils.py#L133) in MRV1 to copy states in hybrid models when prefix caching is enabled in align mode (and under MTP). Every accepted draft step that crosses a block boundary triggers a full sweep of `(num_reqs × total_states)` block copies — for Qwen/Qwen3.5-9B that's 24 linear-attention layers × (conv + temporal) = 48 state copies per accepted step, ~1 MiB temporal + ~80 KiB conv per block.
+A later PR [#42406](https://github.com/vllm-project/vllm/pull/42406) refactored the kernel to reuse the copy mechanism, now delegated to the [_copy_mamba_state_block](https://github.com/vllm-project/vllm/blob/0d12618e98ff2d21d36081e0e9b4eb23573b6d38/vllm/v1/worker/mamba_utils.py#L27) to support align mode prefix caching in MRV2.
 
-A later PR [#42406](https://github.com/vllm-project/vllm/pull/42406) refactored the kernel to reuse the copy mechanism, now delegated to the [_copy_mamba_state_block](https://github.com/vllm-project/vllm/blob/0d12618e98ff2d21d36081e0e9b4eb23573b6d38/vllm/v1/worker/mamba_utils.py#L27) to support align mode prefix cashing in MRV2.
-
-The current copy body issues **1-byte loads and stores**. Temporal states are 20–30× the size of conv states and are contiguous, so the temporal path dominates and leaves most HBM bandwidth on the floor: the kernel tops out at ~62 % of HBM3 peak on H100 and ~33 % of HBM3e peak on GB200 — instruction-issue-/launch-bound rather than bandwidth-bound.
+The current copy body issues **1-byte loads and stores**. Temporal states are 20–30× the size of conv states and are contiguous, so the temporal path dominates and leaves most HBM bandwidth on the floor: the kernel tops out at ~62 % of HBM3 peak on H100 and ~33 % of HBM3e peak on GB200.
 
 This PR switches the temporal-state copy to **`uint64` loads/stores** (8× wider transactions per instruction). To make every issued address safe by construction, `MambaSpecDecodeGPUContext` now asserts at setup that the temporal-state base pointer and per-block stride are both 8-byte aligned; bf16/fp16/fp32 temporal states with contiguous inner dims satisfy this trivially, so the assert is a cheap guardrail rather than a fallback path. The conv path is untouched.
 
-Net effect: the kernel becomes HBM-bandwidth-bound (~74–84 % of peak from `reqs=16` onward on H100/GB200) and the decode-regime latency (`reqs=1–8`) drops ~5.9–6.5× on both H100 and GB200.
-End-to-end on GB200 with MTP this shows up as **+0.75 % / +2.97 % / +1.48 %** output throughput and correspondingly lower median and P99 TPOT/E2EL at concurrencies 32 / 64 / 128, with MTP acceptance unchanged.
+Net effect: the kernel becomes HBM-bandwidth-bound — ~82–84 % of peak on H100 from `reqs≥16` and up to ~74 % on GB200 from `reqs≥32`. For smaller number of requests (`reqs=1–8`) is up to ~5.9–6.5× on both H100 and GB200.
+
+End-to-end on GB200 with MTP this shows up as **+0.75 % / +2.97 % / +1.48 %** output throughput and correspondingly lower median and P99 TPOT at concurrencies 32 / 64 / 128, with MTP acceptance unchanged.
+
 
 ## Test Plan
 
@@ -33,7 +32,7 @@ We sweep the num_req to `{1, 4, 8, 16, 32, 64, 128}` using two GPU architectures
 
 ### End-to-end serving
 
-`vllm bench serve` against `vllm serve` with MTP speculative decoding (which exercises the temporal-state copy on every accepted draft step):
+`vllm bench serve` against `vllm serve` with MTP and prefix caching enabled (which exercises the state copies):
 
 ```bash
 vllm serve \
@@ -60,20 +59,19 @@ Benchmark workload:
         --ignore-eos \
         --percentile-metrics "ttft,tpot,itl,e2el" \
         --metric-percentiles "50,90,99"
-}
 ```
 
 Workload: `--dataset-name random`, `INPUT_LEN=500`, `OUTPUT_LEN=5330`, `NUM_PROMPTS=500`.
 
 The workload is chosen to exercise the `_copy_mamba_state_block` which happens when a block is crossed.
-For Qwen3.5.9B the block size is 533. The output length is chosen to be 10x the block size.
+For Qwen3.5-9B the block size is 533. The output length is chosen to be 10x the block size.
 
 Hardware: NVIDIA GB200. Concurrency sweep `{32, 64, 128}`. At each concurrency we ran the benchmark **4 times per branch and discarded the 1st run** to strip warmup/JIT effects; reported numbers aggregate the remaining 3 runs, with std devs computed as sample std dev (n−1).
 
 Branches compared:
 
-- `main` — `4e5ca89cfe98121642d76b40e32a006f4d0fbf3b`
-- `postprocess_vectorize` — `d7544920e7c8ee1e59e66f4ce113720b02fedd0b`
+- `main` — [`4e5ca89c`](https://github.com/vllm-project/vllm/commit/4e5ca89cfe98121642d76b40e32a006f4d0fbf3b)
+- `postprocess_vectorize` — [`9256ed051`](https://github.com/fuscof-ibm/vllm/commit/9256ed051e0034ca261718cdf8e0663711f9d7d2)
 
 ## Test Result
 
@@ -139,8 +137,8 @@ Total wall across the sweep: **4.50 s → 1.64 s (−63.6%)**. Absolute saving g
 
 **Cross-platform takeaways:**
 
-- Low-`reqs` uplift is **~5.9–6.5× on both GPUs** — the decode-step regime where mamba state-copy latency dominates per-token time.
-- PR saturates H100 HBM at `reqs≥16` (~84% peak); on GB200 it reaches ~74% at `reqs=32` and still has slack.
+- Low-`reqs` uplift is **~5.9–6.5× on both GPUs**.
+- PR saturates H100 HBM at `reqs≥16` (~84% peak); on GB200 it reaches ~74% at `reqs=32`.
 - Decode regime (`reqs=1–8`): sub-350 µs on PR vs 0.96–1.53 ms on MAIN.
 
 ### End-to-end serving (GB200)
@@ -195,7 +193,22 @@ P99 tails:
 
 ### Summary
 
-`_copy_mamba_state_block` goes from ~3–33 % of HBM peak (launch-bound) to ~74–84 % of HBM peak (bandwidth-bound) with a **~5.9–6.5× decode-regime speedup** on both H100 and GB200. End-to-end on GB200 with MTP speculative decoding this shows up as **+0.75 % / +2.97 % / +1.48 %** output throughput and correspondingly lower median and P99 TPOT/E2EL at concurrencies 32 / 64 / 128. Metrics outside the change's blast radius (ITL spikes, TTFT tails, MTP acceptance) are unaffected as expected.
+`_copy_mamba_state_block` goes from ~3–33 % of HBM peak (launch-bound) to ~74–84 % of HBM peak (bandwidth-bound) with a **~5.9–6.5× decode-regime speedup** on both H100 and GB200. End-to-end on GB200 with MTP speculative decoding this shows up as **+0.75 % / +2.97 % / +1.48 %** output throughput and correspondingly lower median and P99 TPOT at concurrencies 32 / 64 / 128. Metrics outside the change's blast radius (ITL spikes, TTFT tails, MTP acceptance) are unaffected as expected.
+
+### AI assistance disclosure
+
+This PR was prepared with AI assistance (Claude Code). The submitter designed the change, ran every benchmark reported here on their own hardware, and reviewed every changed line before commit;
+AI assistance was used for microbenchmark scaffolding.
+
+**Duplicate-work check.** Before opening this PR, the following searches returned no open PR targeting the `_copy_mamba_state_block` temporal-copy path:
+
+```bash
+gh pr list --repo vllm-project/vllm --state open --search "_copy_mamba_state_block"
+gh pr list --repo vllm-project/vllm --state open --search "postprocess_mamba_fused_kernel"
+gh pr list --repo vllm-project/vllm --state open --search "42406 in:body"
+```
+
+PR [#40172](https://github.com/vllm-project/vllm/pull/40172) introduced the kernel and PR [#42406](https://github.com/vllm-project/vllm/pull/42406) refactored dispatch; this PR is the first change to widen the temporal load/store transactions.
 
 ---
 <details>
@@ -205,6 +218,5 @@ P99 tails:
 - [x] The test plan, such as providing test command.
 - [x] The test results, such as pasting the results comparison before and after, or e2e results
 - [ ] (Optional) The necessary documentation update, such as updating `supported_models.md` and `examples` for a new model.
-</details>
 
-**BEFORE SUBMITTING, PLEASE READ <https://docs.vllm.ai/en/latest/contributing>** (anything written below this line will be removed by GitHub Actions)
+</details>
