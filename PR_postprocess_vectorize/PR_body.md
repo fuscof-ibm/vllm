@@ -1,4 +1,4 @@
-## Purpos.
+## Purpose
 
 PR [#40172](https://github.com/vllm-project/vllm/pull/40172) introduced the [postprocess_mamba_fused_kernel](https://github.com/vllm-project/vllm/blob/0d12618e98ff2d21d36081e0e9b4eb23573b6d38/vllm/v1/worker/mamba_utils.py#L133) in MRV1 to copy states in hybrid models when prefix caching is enabled in align mode (and under MTP). Every accepted draft step that crosses a block boundary triggers a full sweep of `(num_reqs × total_states)` block copies — for Qwen/Qwen3.5-9B that's 24 linear-attention layers × (conv + temporal) = 48 state copies per accepted step, ~2 MiB temporal + ~80 KiB conv per block.
 
@@ -11,7 +11,6 @@ This PR switches the temporal-state copy to **`uint64` loads/stores** (8× wider
 Net effect: the kernel becomes HBM-bandwidth-bound — ~82–84 % of peak on H100 from `reqs≥16` and up to ~74 % on GB200 from `reqs≥32`. For smaller number of requests (`reqs=1–8`) is up to ~5.9–6.5× on both H100 and GB200.
 
 End-to-end on GB200 with MTP this shows up as **+0.75 % / +2.97 % / +1.48 %** output throughput and correspondingly lower median and P99 TPOT at concurrencies 32 / 64 / 128, with MTP acceptance unchanged.
-
 
 ## Test Plan
 
@@ -75,6 +74,10 @@ Branches compared:
 
 ## Test Result
 
+Microbenchmarks raw results
+
+E2E raw results:
+
 ### Microbenchmark — kernel throughput
 
 **H100 (HBM3, ~3.35 TB/s peak):**
@@ -137,9 +140,8 @@ Total wall across the sweep: **4.50 s → 1.64 s (−63.6%)**. Absolute saving g
 
 **Cross-platform takeaways:**
 
-- Low-`reqs` uplift is **~5.9–6.5× on both GPUs**.
+- Low-`reqs` (`reqs=1–8`)  uplift is **~5.9–6.5× on both GPUs** : sub-350 µs on PR vs 0.96–1.53 ms on MAIN.
 - PR saturates H100 HBM at `reqs≥16` (~84% peak); on GB200 it reaches ~74% at `reqs=32`.
-- Decode regime (`reqs=1–8`): sub-350 µs on PR vs 0.96–1.53 ms on MAIN.
 
 ### End-to-end serving (GB200)
 
@@ -193,7 +195,7 @@ P99 tails:
 
 ### Summary
 
-`_copy_mamba_state_block` goes from ~3–33 % of HBM peak (launch-bound) to ~74–84 % of HBM peak (bandwidth-bound) with a **~5.9–6.5× decode-regime speedup** on both H100 and GB200. End-to-end on GB200 with MTP speculative decoding this shows up as **+0.75 % / +2.97 % / +1.48 %** output throughput and correspondingly lower median and P99 TPOT at concurrencies 32 / 64 / 128. Metrics outside the change's blast radius (ITL spikes, TTFT tails, MTP acceptance) are unaffected as expected.
+`_copy_mamba_state_block` goes from ~3–33 % of HBM peak (launch-bound) to ~74–84 % of HBM peak (bandwidth-bound) with a **~5.9–6.5× speedup**  on low requests for both H100 and GB200. End-to-end on GB200 with MTP speculative decoding this shows up as **+0.75 % / +2.97 % / +1.48 %** output throughput and correspondingly lower median and P99 TPOT at concurrencies 32 / 64 / 128. Metrics outside the change's blast radius (ITL spikes, TTFT tails, MTP acceptance) are unaffected as expected.
 
 ### AI assistance disclosure
 

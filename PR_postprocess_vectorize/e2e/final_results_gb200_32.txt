@@ -40,8 +40,6 @@ run_one 32
 run_one 32
 run_one 32
 run_one 32
-run_one 32
-run_one 32
 
 
 
@@ -188,7 +186,7 @@ Per-position acceptance (%):
   Position 1:                            97.93     
 ==================================================
  
-results postprocess_vectorize (4575b6f2321d69c9b41ce286f4d520ea52bd3857)
+results postprocess_vectorize (9256ed051e0034ca261718cdf8e0663711f9d7d2)
 
 ============ Serving Benchmark Result ============
 Successful requests:                     500       
