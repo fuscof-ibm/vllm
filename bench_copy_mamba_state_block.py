@@ -6,7 +6,10 @@ Isolates the per-(request, state) mamba state copy body from the surrounding
 postprocess decision logic. Uses the real state layout of Qwen/Qwen3.5-9B
 (tp=1, num_spec=2): 24 linear_attention layers x 2 state types = 48 states,
 - conv state (SD): state_len=5, conv_dim=8192 (bf16, 80 KiB per block)
-- temporal state: (num_v_heads=32, head_v_dim=128, head_k_dim=128) (bf16, 1 MiB per block)
+- temporal state: (num_v_heads=32, head_v_dim=128, head_k_dim=128)
+  (fp32, 2 MiB per block; Qwen3.5 sets mamba_ssm_dtype="float32" in its HF
+  config, which Qwen3_5ForConditionalGenerationConfig.verify_and_update_config
+  propagates into cache_config.mamba_ssm_cache_dtype).
 
 Grid mirrors the fused-kernel launch shape (num_reqs, total_states=48).
 
@@ -63,8 +66,13 @@ TEMPORAL_INNER = (
     LINEAR_NUM_VALUE_HEADS * LINEAR_VALUE_HEAD_DIM * LINEAR_KEY_HEAD_DIM
 )  # 524288
 
-ELEM_SIZE = 2  # bfloat16 by default (mamba_cache_dtype auto -> model_dtype)
-DTYPE = torch.bfloat16
+# Conv state uses model dtype (mamba_cache_dtype "auto" -> model_dtype = bf16).
+# Temporal state uses mamba_ssm_cache_dtype, which Qwen3.5's config override
+# pins to fp32 (matches gated_delta_net_state_dtype at runtime).
+CONV_DTYPE = torch.bfloat16
+TEMPORAL_DTYPE = torch.float32
+CONV_ELEM_SIZE = torch.tensor([], dtype=CONV_DTYPE).element_size()
+TEMPORAL_ELEM_SIZE = torch.tensor([], dtype=TEMPORAL_DTYPE).element_size()
 
 # Each request gets its own src/dst block ids inside every state tensor so
 # concurrent copies don't collide and L2 doesn't mask DRAM bandwidth; the
@@ -147,10 +155,12 @@ def build_state_tensors(conv_state_dim_first: bool, num_blocks: int):
     is_conv_list: list[bool] = []
     for _ in range(NUM_LINEAR_LAYERS):
         conv = torch.empty(
-            (num_blocks, *conv_shape_per_block), dtype=DTYPE, device=DEVICE
+            (num_blocks, *conv_shape_per_block), dtype=CONV_DTYPE, device=DEVICE
         )
         temporal = torch.empty(
-            (num_blocks, *temporal_shape_per_block), dtype=DTYPE, device=DEVICE
+            (num_blocks, *temporal_shape_per_block),
+            dtype=TEMPORAL_DTYPE,
+            device=DEVICE,
         )
         state_tensors.append(conv)
         is_conv_list.append(True)
@@ -349,10 +359,10 @@ def main():
         f"model: Qwen/Qwen3.5-9B tp=1 num_spec={NUM_SPEC}\n"
         f"linear_layers={NUM_LINEAR_LAYERS} state_types={NUM_STATE_TYPES} "
         f"total_states={TOTAL_STATES}\n"
-        f"conv: dim={CONV_DIM} state_len={CONV_STATE_LEN} "
-        f"(={CONV_DIM * CONV_STATE_LEN * ELEM_SIZE / 1024:.1f} KiB/block)\n"
-        f"temporal: inner={TEMPORAL_INNER} "
-        f"(={TEMPORAL_INNER * ELEM_SIZE / 1024 / 1024:.2f} MiB/block)\n"
+        f"conv: dim={CONV_DIM} state_len={CONV_STATE_LEN} dtype={CONV_DTYPE} "
+        f"(={CONV_DIM * CONV_STATE_LEN * CONV_ELEM_SIZE / 1024:.1f} KiB/block)\n"
+        f"temporal: inner={TEMPORAL_INNER} dtype={TEMPORAL_DTYPE} "
+        f"(={TEMPORAL_INNER * TEMPORAL_ELEM_SIZE / 1024 / 1024:.2f} MiB/block)\n"
         f"iters warmup={args.iters_warmup} timed={args.iters_timed}"
     )
     print()
