@@ -327,7 +327,7 @@ def main():
         "--concurrencies",
         type=int,
         nargs="+",
-        default=[32, 64, 128],
+        default=[1, 4, 8, 16, 32, 64, 128],
         help="num_reqs values to sweep (default matches serving benchmark)",
     )
     parser.add_argument(
