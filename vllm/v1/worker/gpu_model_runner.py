@@ -4221,13 +4221,10 @@ class GPUModelRunner(
                 # Python-loop + dict.get() predicate with a single reduction.
                 block_size = mamba_bufs.preprocess.mamba_spec.block_size
                 curr_state = (
-                    (
-                        self.input_batch.num_computed_tokens_cpu[:num_reqs]
-                        + num_scheduled_tokens_np
-                        - 1
-                    )
-                    // block_size
-                ).astype(np.int32, copy=False)
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                    + num_scheduled_tokens_np
+                    - 1
+                ) // block_size
                 last_state = self.input_batch.mamba_last_state_idx[:num_reqs]
                 needs_slow_path = not np.array_equal(curr_state, last_state)
 

@@ -245,7 +245,9 @@ class InputBatch:
         # Mamba: last-step state block index per slot. -1 means "unknown"
         # (new/resumed slot) which forces the align preprocess slow path.
         # Maintained by GPUModelRunner; swapped/moved by swap_states/condense.
-        self.mamba_last_state_idx = np.full((max_num_reqs,), -1, dtype=np.int32)
+        # int64 to match the natural output dtype of the fast-path predicate
+        # so the per-step comparison does not incur a hidden dtype cast.
+        self.mamba_last_state_idx = np.full((max_num_reqs,), -1, dtype=np.int64)
 
         # lora related
         self.request_lora_mapping = np.zeros((self.max_num_reqs,), dtype=np.int64)
