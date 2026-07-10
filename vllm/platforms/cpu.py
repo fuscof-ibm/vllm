@@ -160,6 +160,31 @@ class CpuPlatform(Platform):
             logger.warning_once("Dual-Batch Overlap is not supported on CPU, disabled.")
             parallel_config.enable_dbo = False
 
+        # Downgrade mamba_cache_mode="align" to "all" when speculative decoding
+        # is enabled on a hybrid model and Triton is unavailable. The align
+        # path launches fused mamba Triton kernels (postprocess_mamba_fused_kernel,
+        # preprocess_mamba_align_fused_kernel, precopy_mamba_align_fused_kernel)
+        # that have no C++ fallback in vllm.utils.cpu_triton_utils, so they
+        # would crash at forward time. Prefix caching stays enabled; "all" is
+        # the documented default when prefix caching is on.
+        from vllm.triton_utils import HAS_TRITON
+
+        if (
+            not HAS_TRITON
+            and model_config is not None
+            and model_config.is_hybrid
+            and vllm_config.speculative_config is not None
+            and cache_config.mamba_cache_mode == "align"
+        ):
+            logger.warning_once(
+                "mamba_cache_mode='align' with speculative decoding on a "
+                "hybrid model uses fused Triton kernels that have no CPU "
+                "fallback. Falling back to mamba_cache_mode='all' (prefix "
+                "caching remains enabled). Install triton-cpu to use align "
+                "mode on CPU."
+            )
+            cache_config.mamba_cache_mode = "all"
+
         # Note: workaround for v1 gpu_model_runner
         from vllm.config import CompilationMode
 
