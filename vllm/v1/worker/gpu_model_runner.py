@@ -4202,31 +4202,61 @@ class GPUModelRunner(
                     deferred_state_corrections_fn()
                     deferred_state_corrections_fn = None
                 mamba_bufs = self._get_mamba_bufs()
-                mamba_utils.preprocess_mamba(
-                    scheduler_output,
-                    self.kv_cache_config,
-                    self.cache_config,
-                    self.mamba_state_idx,
-                    self.input_batch,
-                    self.requests,
-                    self.compilation_config.static_forward_context,
-                    self.model.get_mamba_state_copy_func(),
-                    mamba_bufs.preprocess,
+
+                # Fast-exit predicate: preprocess_mamba is a per-request Python
+                # loop that only produces work when a request crosses a mamba
+                # block boundary this step. With block_size in the hundreds/
+                # thousands, steady-state decode traffic almost never crosses,
+                # so skip the loop + the num_accepted_tokens resync when a
+                # cheap CPU-side check proves no crossings and no new/resumed
+                # requests. Cleanup runs first so the predicate observes the
+                # post-cleanup dict.
+                mamba_utils.cleanup_mamba_state_idx(
+                    scheduler_output, self.mamba_state_idx
                 )
-                # preprocess_mamba resets num_accepted_tokens_cpu to 1
-                # for requests whose state was copied to a new block.
-                # Re-sync to GPU so the mamba kernel reads from the
-                # correct initial state slot (init_token_idx = 0).
-                self.num_accepted_tokens.np[:num_reqs] = (
-                    self.input_batch.num_accepted_tokens_cpu[:num_reqs]
-                )
-                self.num_accepted_tokens.copy_to_gpu(num_reqs)
+                block_size = mamba_bufs.preprocess.mamba_spec.block_size
+                curr_state = (
+                    self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                    + num_scheduled_tokens_np
+                    - 1
+                ) // block_size
+                needs_slow_path = False
+                for i, rid in enumerate(req_ids):
+                    prev = self.mamba_state_idx.get(rid)
+                    if prev is None or prev != curr_state[i]:
+                        needs_slow_path = True
+                        break
+
+                if needs_slow_path:
+                    mamba_utils.preprocess_mamba(
+                        scheduler_output,
+                        self.kv_cache_config,
+                        self.cache_config,
+                        self.mamba_state_idx,
+                        self.input_batch,
+                        self.requests,
+                        self.compilation_config.static_forward_context,
+                        self.model.get_mamba_state_copy_func(),
+                        mamba_bufs.preprocess,
+                    )
+                    # preprocess_mamba resets num_accepted_tokens_cpu to 1
+                    # for requests whose state was copied to a new block.
+                    # Re-sync to GPU so the mamba kernel reads from the
+                    # correct initial state slot (init_token_idx = 0).
+                    self.num_accepted_tokens.np[:num_reqs] = (
+                        self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+                    )
+                    self.num_accepted_tokens.copy_to_gpu(num_reqs)
 
                 # Stage per-request inputs for the fused postprocess kernel
                 # only when that kernel will actually run. The kernel is
                 # gated on spec-decode + hybrid (see MambaBuffers.create);
                 # without it, ``mamba_bufs.postprocess_align`` is None and
-                # the staging buffers don't exist.
+                # the staging buffers don't exist. Staging must run every
+                # step: the postprocess kernel's ``needs_copy`` depends on
+                # ``num_accepted`` (post-sampling) and can fire on steps
+                # the preprocess predicate treats as no-op (e.g. a prefill
+                # that ends exactly at a block boundary).
                 if mamba_bufs.postprocess_align is not None:
                     mamba_utils.stage_postprocess_inputs_to_gpu(
                         mamba_bufs.postprocess_align,
