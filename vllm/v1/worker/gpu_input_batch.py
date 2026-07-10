@@ -242,6 +242,11 @@ class InputBatch:
         )
         self.num_accepted_tokens_cpu = self.num_accepted_tokens_cpu_tensor.numpy()
 
+        # Mamba: last-step state block index per slot. -1 means "unknown"
+        # (new/resumed slot) which forces the align preprocess slow path.
+        # Maintained by GPUModelRunner; swapped/moved by swap_states/condense.
+        self.mamba_last_state_idx = np.full((max_num_reqs,), -1, dtype=np.int32)
+
         # lora related
         self.request_lora_mapping = np.zeros((self.max_num_reqs,), dtype=np.int64)
         self.lora_id_to_request_ids: dict[int, set[str]] = {}
@@ -465,6 +470,9 @@ class InputBatch:
 
         # Speculative decoding: by default 1 token is generated.
         self.num_accepted_tokens_cpu[req_index] = 1
+        # Mamba: mark slot as needing slow-path preprocess. The runner
+        # populates this after the first align preprocess for this request.
+        self.mamba_last_state_idx[req_index] = -1
 
         # Add request lora ID
         if request.lora_request:
@@ -663,6 +671,10 @@ class InputBatch:
             self.num_accepted_tokens_cpu[i2],
             self.num_accepted_tokens_cpu[i1],
         )
+        self.mamba_last_state_idx[i1], self.mamba_last_state_idx[i2] = (
+            self.mamba_last_state_idx[i2],
+            self.mamba_last_state_idx[i1],
+        )
 
         swap_dict_values(self.generators, i1, i2)
         swap_dict_values(self.bad_words_token_ids, i1, i2)
@@ -785,6 +797,9 @@ class InputBatch:
                 last_req_index
             ]
             self.num_accepted_tokens_cpu[empty_index] = self.num_accepted_tokens_cpu[
+                last_req_index
+            ]
+            self.mamba_last_state_idx[empty_index] = self.mamba_last_state_idx[
                 last_req_index
             ]
             generator = self.generators.pop(last_req_index, None)

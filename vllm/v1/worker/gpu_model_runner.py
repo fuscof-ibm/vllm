@@ -4203,29 +4203,33 @@ class GPUModelRunner(
                     deferred_state_corrections_fn = None
                 mamba_bufs = self._get_mamba_bufs()
 
-                # Fast-exit predicate: preprocess_mamba is a per-request Python
-                # loop that only produces work when a request crosses a mamba
-                # block boundary this step. With block_size in the hundreds/
-                # thousands, steady-state decode traffic almost never crosses,
-                # so skip the loop + the num_accepted_tokens resync when a
-                # cheap CPU-side check proves no crossings and no new/resumed
-                # requests. Cleanup runs first so the predicate observes the
-                # post-cleanup dict.
+                # Keep the dict free of finished/preempted/resumed req_ids
+                # every step so it does not grow unboundedly. The array-based
+                # fast-path predicate below does not rely on the dict, but
+                # preprocess_mamba (slow path) does.
                 mamba_utils.cleanup_mamba_state_idx(
                     scheduler_output, self.mamba_state_idx
                 )
+
+                # Fast-exit predicate: preprocess_mamba is a per-request Python
+                # loop that only produces work when a request crosses a mamba
+                # block boundary this step. Compare this step's post-scheduling
+                # state-block index (vectorized numpy) against the batch-slot-
+                # indexed ``mamba_last_state_idx`` maintained by GPUInputBatch.
+                # New/resumed slots start at -1 and always trip the slow path,
+                # which then refreshes the array. This replaces the previous
+                # Python-loop + dict.get() predicate with a single reduction.
                 block_size = mamba_bufs.preprocess.mamba_spec.block_size
                 curr_state = (
-                    self.input_batch.num_computed_tokens_cpu[:num_reqs]
-                    + num_scheduled_tokens_np
-                    - 1
-                ) // block_size
-                needs_slow_path = False
-                for i, rid in enumerate(req_ids):
-                    prev = self.mamba_state_idx.get(rid)
-                    if prev is None or prev != curr_state[i]:
-                        needs_slow_path = True
-                        break
+                    (
+                        self.input_batch.num_computed_tokens_cpu[:num_reqs]
+                        + num_scheduled_tokens_np
+                        - 1
+                    )
+                    // block_size
+                ).astype(np.int32, copy=False)
+                last_state = self.input_batch.mamba_last_state_idx[:num_reqs]
+                needs_slow_path = not np.array_equal(curr_state, last_state)
 
                 if needs_slow_path:
                     mamba_utils.preprocess_mamba(
@@ -4247,6 +4251,11 @@ class GPUModelRunner(
                         self.input_batch.num_accepted_tokens_cpu[:num_reqs]
                     )
                     self.num_accepted_tokens.copy_to_gpu(num_reqs)
+                    # Refresh the fast-path array. preprocess_mamba wrote
+                    # curr_state_idx = cdiv(computed+scheduled, bs) - 1 into
+                    # mamba_state_idx for every req, which is identical to
+                    # ``curr_state`` above.
+                    self.input_batch.mamba_last_state_idx[:num_reqs] = curr_state
 
                 # Stage per-request inputs for the fused postprocess kernel
                 # only when that kernel will actually run. The kernel is
