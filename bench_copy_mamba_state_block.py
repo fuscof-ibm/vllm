@@ -3,15 +3,25 @@
 """Microbenchmark for the `_copy_mamba_state_block` device function.
 
 Isolates the per-(request, state) mamba state copy body from the surrounding
-postprocess decision logic. Uses the real state layout of Qwen/Qwen3.5-9B
-(tp=1, num_spec=2): 24 linear_attention layers x 2 state types = 48 states,
-- conv state (SD): state_len=5, conv_dim=8192 (bf16, 80 KiB per block)
-- temporal state: (num_v_heads=32, head_v_dim=128, head_k_dim=128)
-  (fp32, 2 MiB per block; Qwen3.5 sets mamba_ssm_dtype="float32" in its HF
-  config, which Qwen3_5ForConditionalGenerationConfig.verify_and_update_config
-  propagates into cache_config.mamba_ssm_cache_dtype).
+postprocess decision logic. State layouts for supported models (all tp=1):
 
-Grid mirrors the fused-kernel launch shape (num_reqs, total_states=48).
+- Qwen/Qwen3.5-9B (gated delta net, num_spec=2): 24 linear layers x 2 state
+  types = 48 states,
+  - conv state: state_len=5, conv_dim=8192 (bf16, 80 KiB/block)
+  - temporal: (num_v_heads=32, head_v_dim=128, head_k_dim=128) fp32
+    (2 MiB/block; mamba_ssm_cache_dtype from HF config).
+- Qwen/Qwen3.5-0.8B (gated delta net, num_spec=2): 18 linear layers x 2 state
+  types = 36 states,
+  - conv state: state_len=5, conv_dim=6144 (bf16, 60 KiB/block)
+  - temporal: (num_v_heads=16, head_v_dim=128, head_k_dim=128) fp32
+    (1 MiB/block; mamba_ssm_dtype=float32 in HF config).
+- nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (mamba2, num_spec=1): 40
+  mamba layers x 2 = 80 states,
+  - conv state: state_len=4, conv_dim=10240 (bf16, 80 KiB/block)
+  - temporal: (mamba_num_heads=128, mamba_head_dim=64, ssm_state_size=128)
+    fp32 (4 MiB/block; mamba_ssm_cache_dtype="float32").
+
+Grid mirrors the fused-kernel launch shape (num_reqs, total_states).
 
 Usage:
     # nsys (whole-run trace)
@@ -34,6 +44,7 @@ Usage:
 
 import argparse
 import time
+from dataclasses import dataclass
 
 import torch
 import torch.cuda.nvtx as nvtx
@@ -43,36 +54,97 @@ from vllm.v1.worker.mamba_utils import _copy_mamba_state_block
 
 DEVICE = "cuda"
 
-# Qwen/Qwen3.5-9B linear-attention (gated delta net) state layout, tp=1.
+
+@dataclass(frozen=True)
+class ModelStateConfig:
+    """State layout parameters for one hybrid-mamba model at tp=1.
+
+    All values are derived from the model's HF config plus a chosen num_spec.
+    Conv/temporal shapes here are per-block (num_blocks is added at runtime).
+    """
+
+    name: str
+    num_state_layers: int
+    conv_dim: int
+    conv_state_len: int
+    temporal_shape: tuple[int, int, int]
+    conv_dtype: torch.dtype
+    temporal_dtype: torch.dtype
+    num_spec: int
+    layer_kind: str  # "gated_delta_net", "mamba2", ...
+    notes: str = ""
+
+    @property
+    def total_states(self) -> int:
+        return self.num_state_layers * 2  # conv + temporal
+
+
+# Qwen/Qwen3.5-9B: gated delta net, 24 linear + 8 full-attn out of 32.
 # See huggingface.co/Qwen/Qwen3.5-9B/config.json and
 # MambaStateShapeCalculator.gated_delta_net_state_shape.
-NUM_LINEAR_LAYERS = 24  # 24 linear + 8 full_attention (interval 4) out of 32
-NUM_STATE_TYPES = 2  # conv + temporal
-TOTAL_STATES = NUM_LINEAR_LAYERS * NUM_STATE_TYPES  # 48
-
-LINEAR_NUM_KEY_HEADS = 16
-LINEAR_NUM_VALUE_HEADS = 32
-LINEAR_KEY_HEAD_DIM = 128
-LINEAR_VALUE_HEAD_DIM = 128
-LINEAR_CONV_KERNEL_DIM = 4
-NUM_SPEC = 2  # matches the serving benchmark's speculative-config
-
-CONV_DIM = (
-    LINEAR_KEY_HEAD_DIM * LINEAR_NUM_KEY_HEADS * 2
-    + LINEAR_VALUE_HEAD_DIM * LINEAR_NUM_VALUE_HEADS
+#   conv_dim = head_k*num_k_heads*2 + head_v*num_v_heads
+#            = 128*16*2 + 128*32 = 8192
+#   temporal = (num_v_heads, head_v_dim, head_k_dim) = (32, 128, 128)
+_QWEN3_5_9B = ModelStateConfig(
+    name="Qwen/Qwen3.5-9B",
+    num_state_layers=24,
+    conv_dim=8192,
+    conv_state_len=4 - 1 + 2,  # conv_kernel - 1 + num_spec
+    temporal_shape=(32, 128, 128),
+    conv_dtype=torch.bfloat16,
+    temporal_dtype=torch.float32,
+    num_spec=2,
+    layer_kind="gated_delta_net",
+    notes="24 linear + 8 full_attention (interval 4) out of 32",
 )
-CONV_STATE_LEN = LINEAR_CONV_KERNEL_DIM - 1 + NUM_SPEC  # 5
-TEMPORAL_INNER = (
-    LINEAR_NUM_VALUE_HEADS * LINEAR_VALUE_HEAD_DIM * LINEAR_KEY_HEAD_DIM
-)  # 524288
 
-# Conv state uses model dtype (mamba_cache_dtype "auto" -> model_dtype = bf16).
-# Temporal state uses mamba_ssm_cache_dtype, which Qwen3.5's config override
-# pins to fp32 (matches gated_delta_net_state_dtype at runtime).
-CONV_DTYPE = torch.bfloat16
-TEMPORAL_DTYPE = torch.float32
-CONV_ELEM_SIZE = torch.tensor([], dtype=CONV_DTYPE).element_size()
-TEMPORAL_ELEM_SIZE = torch.tensor([], dtype=TEMPORAL_DTYPE).element_size()
+# nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4: mamba2, 40 M + 8 * + 40 E
+# out of 88 layers (hybrid_override_pattern in HF config).
+# See huggingface.co/nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4/config.json
+# and MambaStateShapeCalculator.mamba2_state_shape.
+#   intermediate = mamba_num_heads * mamba_head_dim = 128*64 = 8192
+#   conv_dim = intermediate + 2*n_groups*ssm_state_size
+#            = 8192 + 2*8*128 = 10240
+#   temporal = (mamba_num_heads, mamba_head_dim, ssm_state_size)
+#            = (128, 64, 128)
+# num_spec=1 matches num_nextn_predict_layers in the HF config.
+_NEMOTRON3_SUPER_120B = ModelStateConfig(
+    name="nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4",
+    num_state_layers=40,
+    conv_dim=10240,
+    conv_state_len=4 - 1 + 1,  # conv_kernel - 1 + num_spec
+    temporal_shape=(128, 64, 128),
+    conv_dtype=torch.bfloat16,
+    temporal_dtype=torch.float32,
+    num_spec=1,
+    layer_kind="mamba2",
+    notes="40 mamba + 8 attention + 40 moe out of 88",
+)
+
+# Qwen/Qwen3.5-0.8B: gated delta net, 18 linear + 6 full-attn out of 24.
+# See huggingface.co/Qwen/Qwen3.5-0.8B/config.json and
+# MambaStateShapeCalculator.gated_delta_net_state_shape.
+#   conv_dim = head_k*num_k_heads*2 + head_v*num_v_heads
+#            = 128*16*2 + 128*16 = 6144
+#   temporal = (num_v_heads, head_v_dim, head_k_dim) = (16, 128, 128)
+_QWEN3_5_0_8B = ModelStateConfig(
+    name="Qwen/Qwen3.5-0.8B",
+    num_state_layers=18,
+    conv_dim=6144,
+    conv_state_len=4 - 1 + 2,  # conv_kernel - 1 + num_spec
+    temporal_shape=(16, 128, 128),
+    conv_dtype=torch.bfloat16,
+    temporal_dtype=torch.float32,
+    num_spec=2,
+    layer_kind="gated_delta_net",
+    notes="18 linear + 6 full_attention (interval 4) out of 24",
+)
+
+MODEL_CONFIGS: dict[str, ModelStateConfig] = {
+    _QWEN3_5_9B.name: _QWEN3_5_9B,
+    _QWEN3_5_0_8B.name: _QWEN3_5_0_8B,
+    _NEMOTRON3_SUPER_120B.name: _NEMOTRON3_SUPER_120B,
+}
 
 # Each request gets its own src/dst block ids inside every state tensor so
 # concurrent copies don't collide and L2 doesn't mask DRAM bandwidth; the
@@ -134,32 +206,31 @@ def bench_copy_mamba_state_block(
     )
 
 
-def build_state_tensors(conv_state_dim_first: bool, num_blocks: int):
-    """Allocate one conv and one temporal state tensor per linear layer.
+def build_state_tensors(
+    model: ModelStateConfig, conv_state_dim_first: bool, num_blocks: int
+):
+    """Allocate one conv and one temporal state tensor per state-carrying layer.
 
     Returns interleaved [conv0, temp0, conv1, temp1, ...] to match the flat
     metadata layout produced by MambaSpecDecodeGPUContext.
     """
     conv_shape_per_block = (
-        (CONV_DIM, CONV_STATE_LEN)
+        (model.conv_dim, model.conv_state_len)
         if conv_state_dim_first
-        else (CONV_STATE_LEN, CONV_DIM)
-    )
-    temporal_shape_per_block = (
-        LINEAR_NUM_VALUE_HEADS,
-        LINEAR_VALUE_HEAD_DIM,
-        LINEAR_KEY_HEAD_DIM,
+        else (model.conv_state_len, model.conv_dim)
     )
 
     state_tensors: list[torch.Tensor] = []
     is_conv_list: list[bool] = []
-    for _ in range(NUM_LINEAR_LAYERS):
+    for _ in range(model.num_state_layers):
         conv = torch.empty(
-            (num_blocks, *conv_shape_per_block), dtype=CONV_DTYPE, device=DEVICE
+            (num_blocks, *conv_shape_per_block),
+            dtype=model.conv_dtype,
+            device=DEVICE,
         )
         temporal = torch.empty(
-            (num_blocks, *temporal_shape_per_block),
-            dtype=TEMPORAL_DTYPE,
+            (num_blocks, *model.temporal_shape),
+            dtype=model.temporal_dtype,
             device=DEVICE,
         )
         state_tensors.append(conv)
@@ -231,6 +302,7 @@ def bytes_moved_per_launch(state_tensors, is_conv_list, conv_state_dim_first: bo
 
 
 def bench_one(
+    model: ModelStateConfig,
     num_reqs: int,
     conv_state_dim_first: bool,
     iters_warmup: int,
@@ -239,7 +311,9 @@ def bench_one(
     # Give every request distinct src/dst block ids so concurrent copies don't
     # share cache lines. State tensors hold at least 2*num_reqs blocks.
     num_blocks = 2 * num_reqs
-    state_tensors, is_conv_list = build_state_tensors(conv_state_dim_first, num_blocks)
+    state_tensors, is_conv_list = build_state_tensors(
+        model, conv_state_dim_first, num_blocks
+    )
     (
         state_base_addrs,
         state_block_strides,
@@ -263,7 +337,7 @@ def bench_one(
     )
     block_table_stride_req = block_table.stride(0)
 
-    grid = (num_reqs, TOTAL_STATES)
+    grid = (num_reqs, model.total_states)
     args = (
         SRC_COL,
         DST_COL,
@@ -324,6 +398,17 @@ def bench_one(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--model",
+        choices=sorted(MODEL_CONFIGS.keys()),
+        default=_QWEN3_5_9B.name,
+        help="Model whose state layout drives the benchmark.",
+    )
+    parser.add_argument(
+        "--list-models",
+        action="store_true",
+        help="List available model names for --model and exit.",
+    )
+    parser.add_argument(
         "--concurrencies",
         type=int,
         nargs="+",
@@ -353,16 +438,31 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.list_models:
+        for name in sorted(MODEL_CONFIGS.keys()):
+            print(name)
+        return
+
+    model = MODEL_CONFIGS[args.model]
+    conv_elem = torch.tensor([], dtype=model.conv_dtype).element_size()
+    temp_elem = torch.tensor([], dtype=model.temporal_dtype).element_size()
+    conv_bytes_per_block = model.conv_dim * model.conv_state_len * conv_elem
+    th, td1, td2 = model.temporal_shape
+    temp_inner = th * td1 * td2
+    temp_bytes_per_block = temp_inner * temp_elem
+
     assert torch.cuda.is_available(), "CUDA required"
     print(f"device: {torch.cuda.get_device_name(0)}")
     print(
-        f"model: Qwen/Qwen3.5-9B tp=1 num_spec={NUM_SPEC}\n"
-        f"linear_layers={NUM_LINEAR_LAYERS} state_types={NUM_STATE_TYPES} "
-        f"total_states={TOTAL_STATES}\n"
-        f"conv: dim={CONV_DIM} state_len={CONV_STATE_LEN} dtype={CONV_DTYPE} "
-        f"(={CONV_DIM * CONV_STATE_LEN * CONV_ELEM_SIZE / 1024:.1f} KiB/block)\n"
-        f"temporal: inner={TEMPORAL_INNER} dtype={TEMPORAL_DTYPE} "
-        f"(={TEMPORAL_INNER * TEMPORAL_ELEM_SIZE / 1024 / 1024:.2f} MiB/block)\n"
+        f"model: {model.name} ({model.layer_kind}) tp=1 num_spec={model.num_spec}\n"
+        f"state_layers={model.num_state_layers} state_types=2 "
+        f"total_states={model.total_states}  # {model.notes}\n"
+        f"conv: dim={model.conv_dim} state_len={model.conv_state_len} "
+        f"dtype={model.conv_dtype} "
+        f"(={conv_bytes_per_block / 1024:.1f} KiB/block)\n"
+        f"temporal: shape={model.temporal_shape} inner={temp_inner} "
+        f"dtype={model.temporal_dtype} "
+        f"(={temp_bytes_per_block / 1024 / 1024:.2f} MiB/block)\n"
         f"iters warmup={args.iters_warmup} timed={args.iters_timed}"
     )
     print()
@@ -377,7 +477,7 @@ def main():
     t0 = time.perf_counter()
     for conv_ds in layouts:
         for nr in args.concurrencies:
-            bench_one(nr, conv_ds, args.iters_warmup, args.iters_timed)
+            bench_one(model, nr, conv_ds, args.iters_warmup, args.iters_timed)
     torch.cuda.cudart().cudaProfilerStop()
     print(f"\ntotal wall: {time.perf_counter() - t0:.2f}s")
 
