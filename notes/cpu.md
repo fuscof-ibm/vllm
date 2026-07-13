@@ -1,9 +1,61 @@
 # install
 
-uv venv --python 3.12 .venv-cpu
-source .venv-cpu/bin/activate
+
+The `build_cpu.sh`:
+
+```
+#!/bin/bash
+
+VLLM_WORKTREE="vllm"
+
+cd $VLLM_WORKTREE && uv venv venv_cpu --python 3.12
+source ./venv_cpu/bin/activate
+
+
+#uv pip install torch==2.11.0+cpu --index-url https://download.pytorch.org/whl/cpu
+#VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_VARIANT=cpu VLLM_TARGET_DEVICE=cpu \
+#  uv pip install --editable . --no-deps
+
 VLLM_USE_PRECOMPILED=1 VLLM_PRECOMPILED_WHEEL_VARIANT=cpu VLLM_TARGET_DEVICE=cpu \
-  uv pip install --editable .
+  uv pip install --editable . \
+  --extra-index-url https://download.pytorch.org/whl/cpu \
+  --index-strategy unsafe-best-match
+```
+
+Running it
+
+
+```
+cat run_cpu.sh 
+#!/bin/bash
+
+
+VLLM_TARGET_DEVICE=cpu \
+VLLM_CPU_KVCACHE_SPACE=8 \
+python -c "
+from vllm import LLM, SamplingParams
+llm = LLM(
+    model='ibm-granite/granite-4.0-tiny-preview',
+    enforce_eager=True,
+    speculative_config={'method':'ngram','num_speculative_tokens':3,
+                        'prompt_lookup_max':4},
+    max_model_len=512,
+)
+print(llm.generate(['Hello'], SamplingParams(max_tokens=16))[0].outputs[0].text)"
+
+    #enable_prefix_caching=True,
+    #mamba_cache_mode='align',   # will get downgraded
+```
+**NOTE** We get always the following error on hybrid models on CPU (without triton) 
+
+
+From `main (b3cfca99)`
+
+
+```
+(EngineCore pid=1473934) ERROR 07-13 11:28:14 [core.py:1242] RuntimeError: Worker failed with error 'module 'triton' has no attribute 'next_power_of_2'', please check the stack trace above for the root cause
+```
+
 
 # To see
 
