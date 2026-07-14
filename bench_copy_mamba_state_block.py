@@ -176,6 +176,7 @@ def bench_copy_mamba_state_block(
     num_reqs,
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
+    TEMPORAL_TILES: tl.constexpr,
 ):
     """Minimal wrapper: run the copy body for every (batch, state) program.
 
@@ -183,6 +184,7 @@ def bench_copy_mamba_state_block(
     """
     batch_idx = tl.program_id(0)
     state_idx = tl.program_id(1)
+    tile_idx = tl.program_id(2)
     if batch_idx >= num_reqs:
         return
     _copy_mamba_state_block(
@@ -201,8 +203,10 @@ def bench_copy_mamba_state_block(
         state_group_indices_ptr,
         state_dim_row_count_ptr,
         state_dim_row_stride_ptr,
+        tile_idx,
         COPY_BLOCK_SIZE,
         CONV_STATE_DIM_FIRST,
+        TEMPORAL_TILES,
     )
 
 
@@ -337,7 +341,9 @@ def bench_one(
     )
     block_table_stride_req = block_table.stride(0)
 
-    grid = (num_reqs, model.total_states)
+    temporal_tiles = 8
+
+    grid = (num_reqs, model.total_states, temporal_tiles)
     args = (
         SRC_COL,
         DST_COL,
@@ -360,6 +366,7 @@ def bench_one(
             *args,
             COPY_BLOCK_SIZE=COPY_BLOCK_SIZE,
             CONV_STATE_DIM_FIRST=conv_state_dim_first,
+            TEMPORAL_TILES=temporal_tiles,
         )
 
     for _ in range(iters_warmup):
