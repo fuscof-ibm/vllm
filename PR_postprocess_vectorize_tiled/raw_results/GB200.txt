@@ -1,0 +1,153 @@
+(vllm-dev) root@slurm-gb200-223-065:/mnt/home/fuscof/vllm# ./memcpy_bench.sh 
+Updating files: 100% (1252/1252), done.
+Switched to branch 'last_precompiled'
+Your branch is up to date with 'origin/last_precompiled'.
+device: NVIDIA GB200
+model: Qwen/Qwen3.5-0.8B (gated_delta_net) tp=1 num_spec=2
+state_layers=18 state_types=2 total_states=36  # 18 linear + 6 full_attention (interval 4) out of 24
+conv: dim=6144 state_len=5 dtype=torch.bfloat16 (=60.0 KiB/block)
+temporal: shape=(16, 128, 128) inner=262144 dtype=torch.float32 (=1.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 36)          copy/req= 19.05 MiB  avg=  366.36 us  BW~ 109.1 GB/s
+reqs=4_conv=SD           grid=(4, 36)          copy/req= 19.05 MiB  avg=  727.02 us  BW~ 219.9 GB/s
+reqs=8_conv=SD           grid=(8, 36)          copy/req= 19.05 MiB  avg=  757.96 us  BW~ 421.8 GB/s
+reqs=16_conv=SD          grid=(16, 36)         copy/req= 19.05 MiB  avg=  798.35 us  BW~ 800.9 GB/s
+reqs=32_conv=SD          grid=(32, 36)         copy/req= 19.05 MiB  avg=  876.53 us  BW~1458.9 GB/s
+reqs=64_conv=SD          grid=(64, 36)         copy/req= 19.05 MiB  avg= 1280.85 us  BW~1996.7 GB/s
+reqs=128_conv=SD         grid=(128, 36)        copy/req= 19.05 MiB  avg= 1988.46 us  BW~2572.3 GB/s
+
+total wall: 1.99s
+device: NVIDIA GB200
+model: Qwen/Qwen3.5-9B (gated_delta_net) tp=1 num_spec=2
+state_layers=24 state_types=2 total_states=48  # 24 linear + 8 full_attention (interval 4) out of 32
+conv: dim=8192 state_len=5 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(32, 128, 128) inner=524288 dtype=torch.float32 (=2.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 48)          copy/req= 49.88 MiB  avg= 1405.54 us  BW~  74.4 GB/s
+reqs=4_conv=SD           grid=(4, 48)          copy/req= 49.88 MiB  avg= 1481.95 us  BW~ 282.3 GB/s
+reqs=8_conv=SD           grid=(8, 48)          copy/req= 49.88 MiB  avg= 1516.10 us  BW~ 551.9 GB/s
+reqs=16_conv=SD          grid=(16, 48)         copy/req= 49.88 MiB  avg= 1633.88 us  BW~1024.3 GB/s
+reqs=32_conv=SD          grid=(32, 48)         copy/req= 49.88 MiB  avg= 1927.25 us  BW~1736.7 GB/s
+reqs=64_conv=SD          grid=(64, 48)         copy/req= 49.88 MiB  avg= 3221.94 us  BW~2077.7 GB/s
+reqs=128_conv=SD         grid=(128, 48)        copy/req= 49.88 MiB  avg= 5138.15 us  BW~2605.6 GB/s
+
+total wall: 4.04s
+device: NVIDIA GB200
+model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (mamba2) tp=1 num_spec=1
+state_layers=40 state_types=2 total_states=80  # 40 mamba + 8 attention + 40 moe out of 88
+conv: dim=10240 state_len=4 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(128, 64, 128) inner=1048576 dtype=torch.float32 (=4.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 80)          copy/req=163.12 MiB  avg= 2851.36 us  BW~ 120.0 GB/s
+reqs=4_conv=SD           grid=(4, 80)          copy/req=163.12 MiB  avg= 3054.35 us  BW~ 448.0 GB/s
+reqs=8_conv=SD           grid=(8, 80)          copy/req=163.12 MiB  avg= 3231.84 us  BW~ 846.8 GB/s
+reqs=16_conv=SD          grid=(16, 80)         copy/req=163.12 MiB  avg= 3602.95 us  BW~1519.2 GB/s
+reqs=32_conv=SD          grid=(32, 80)         copy/req=163.12 MiB  avg= 5161.50 us  BW~2120.9 GB/s
+reqs=64_conv=SD          grid=(64, 80)         copy/req=163.12 MiB  avg= 8358.71 us  BW~2619.3 GB/s
+reqs=128_conv=SD         grid=(128, 80)        copy/req=163.12 MiB  avg=14952.54 us  BW~2928.5 GB/s
+
+total wall: 9.57s
+Updating files: 100% (1252/1252), done.
+Switched to branch 'postprocess_vectorize'
+Your branch is up to date with 'origin/postprocess_vectorize'.
+device: NVIDIA GB200
+model: Qwen/Qwen3.5-0.8B (gated_delta_net) tp=1 num_spec=2
+state_layers=18 state_types=2 total_states=36  # 18 linear + 6 full_attention (interval 4) out of 24
+conv: dim=6144 state_len=5 dtype=torch.bfloat16 (=60.0 KiB/block)
+temporal: shape=(16, 128, 128) inner=262144 dtype=torch.float32 (=1.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 36)          copy/req= 19.05 MiB  avg=   64.27 us  BW~ 621.8 GB/s
+reqs=4_conv=SD           grid=(4, 36)          copy/req= 19.05 MiB  avg=  119.19 us  BW~1341.0 GB/s
+reqs=8_conv=SD           grid=(8, 36)          copy/req= 19.05 MiB  avg=  135.34 us  BW~2362.1 GB/s
+reqs=16_conv=SD          grid=(16, 36)         copy/req= 19.05 MiB  avg=  156.84 us  BW~4076.5 GB/s
+reqs=32_conv=SD          grid=(32, 36)         copy/req= 19.05 MiB  avg=  228.62 us  BW~5593.2 GB/s
+reqs=64_conv=SD          grid=(64, 36)         copy/req= 19.05 MiB  avg=  488.46 us  BW~5235.7 GB/s
+reqs=128_conv=SD         grid=(128, 36)        copy/req= 19.05 MiB  avg=  870.97 us  BW~5872.7 GB/s
+
+total wall: 0.95s
+device: NVIDIA GB200
+model: Qwen/Qwen3.5-9B (gated_delta_net) tp=1 num_spec=2
+state_layers=24 state_types=2 total_states=48  # 24 linear + 8 full_attention (interval 4) out of 32
+conv: dim=8192 state_len=5 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(32, 128, 128) inner=524288 dtype=torch.float32 (=2.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 48)          copy/req= 49.88 MiB  avg=  216.65 us  BW~ 482.8 GB/s
+reqs=4_conv=SD           grid=(4, 48)          copy/req= 49.88 MiB  avg=  252.81 us  BW~1654.9 GB/s
+reqs=8_conv=SD           grid=(8, 48)          copy/req= 49.88 MiB  avg=  273.10 us  BW~3063.9 GB/s
+reqs=16_conv=SD          grid=(16, 48)         copy/req= 49.88 MiB  avg=  353.90 us  BW~4728.8 GB/s
+reqs=32_conv=SD          grid=(32, 48)         copy/req= 49.88 MiB  avg=  566.43 us  BW~5909.0 GB/s
+reqs=64_conv=SD          grid=(64, 48)         copy/req= 49.88 MiB  avg= 1294.52 us  BW~5171.1 GB/s
+reqs=128_conv=SD         grid=(128, 48)        copy/req= 49.88 MiB  avg= 2309.48 us  BW~5797.1 GB/s
+
+total wall: 1.60s
+device: NVIDIA GB200
+model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (mamba2) tp=1 num_spec=1
+state_layers=40 state_types=2 total_states=80  # 40 mamba + 8 attention + 40 moe out of 88
+conv: dim=10240 state_len=4 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(128, 64, 128) inner=1048576 dtype=torch.float32 (=4.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 80)          copy/req=163.12 MiB  avg=  434.13 us  BW~ 788.0 GB/s
+reqs=4_conv=SD           grid=(4, 80)          copy/req=163.12 MiB  avg=  541.47 us  BW~2527.2 GB/s
+reqs=8_conv=SD           grid=(8, 80)          copy/req=163.12 MiB  avg=  653.57 us  BW~4187.4 GB/s
+reqs=16_conv=SD          grid=(16, 80)         copy/req=163.12 MiB  avg=  962.39 us  BW~5687.5 GB/s
+reqs=32_conv=SD          grid=(32, 80)         copy/req=163.12 MiB  avg= 2085.41 us  BW~5249.4 GB/s
+reqs=64_conv=SD          grid=(64, 80)         copy/req=163.12 MiB  avg= 3784.75 us  BW~5784.9 GB/s
+reqs=128_conv=SD         grid=(128, 80)        copy/req=163.12 MiB  avg= 7340.13 us  BW~5965.6 GB/s
+
+total wall: 3.98s
+Switched to branch 'postprocess_vectorize_tiled'
+Your branch is up to date with 'origin/postprocess_vectorize_tiled'.
+device: NVIDIA GB200
+model: Qwen/Qwen3.5-0.8B (gated_delta_net) tp=1 num_spec=2
+state_layers=18 state_types=2 total_states=36  # 18 linear + 6 full_attention (interval 4) out of 24
+conv: dim=6144 state_len=5 dtype=torch.bfloat16 (=60.0 KiB/block)
+temporal: shape=(16, 128, 128) inner=262144 dtype=torch.float32 (=1.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 36, 8)       copy/req= 19.05 MiB  avg=   14.65 us  BW~2726.9 GB/s
+reqs=4_conv=SD           grid=(4, 36, 8)       copy/req= 19.05 MiB  avg=   47.71 us  BW~3350.1 GB/s
+reqs=8_conv=SD           grid=(8, 36, 8)       copy/req= 19.05 MiB  avg=   65.95 us  BW~4847.3 GB/s
+reqs=16_conv=SD          grid=(16, 36, 8)      copy/req= 19.05 MiB  avg=  107.76 us  BW~5933.1 GB/s
+reqs=32_conv=SD          grid=(32, 36, 8)      copy/req= 19.05 MiB  avg=  202.17 us  BW~6325.0 GB/s
+reqs=64_conv=SD          grid=(64, 36, 8)      copy/req= 19.05 MiB  avg=  391.29 us  BW~6536.1 GB/s
+reqs=128_conv=SD         grid=(128, 36, 8)     copy/req= 19.05 MiB  avg=  769.56 us  BW~6646.6 GB/s
+
+total wall: 0.78s
+device: NVIDIA GB200
+model: Qwen/Qwen3.5-9B (gated_delta_net) tp=1 num_spec=2
+state_layers=24 state_types=2 total_states=48  # 24 linear + 8 full_attention (interval 4) out of 32
+conv: dim=8192 state_len=5 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(32, 128, 128) inner=524288 dtype=torch.float32 (=2.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 48, 8)       copy/req= 49.88 MiB  avg=   39.53 us  BW~2646.1 GB/s
+reqs=4_conv=SD           grid=(4, 48, 8)       copy/req= 49.88 MiB  avg=   88.45 us  BW~4730.3 GB/s
+reqs=8_conv=SD           grid=(8, 48, 8)       copy/req= 49.88 MiB  avg=  159.47 us  BW~5247.2 GB/s
+reqs=16_conv=SD          grid=(16, 48, 8)      copy/req= 49.88 MiB  avg=  283.53 us  BW~5902.6 GB/s
+reqs=32_conv=SD          grid=(32, 48, 8)      copy/req= 49.88 MiB  avg=  519.99 us  BW~6436.7 GB/s
+reqs=64_conv=SD          grid=(64, 48, 8)      copy/req= 49.88 MiB  avg= 1021.14 us  BW~6555.5 GB/s
+reqs=128_conv=SD         grid=(128, 48, 8)     copy/req= 49.88 MiB  avg= 2023.66 us  BW~6615.9 GB/s
+
+total wall: 1.35s
+device: NVIDIA GB200
+model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (mamba2) tp=1 num_spec=1
+state_layers=40 state_types=2 total_states=80  # 40 mamba + 8 attention + 40 moe out of 88
+conv: dim=10240 state_len=4 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(128, 64, 128) inner=1048576 dtype=torch.float32 (=4.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 80, 8)       copy/req=163.12 MiB  avg=  102.70 us  BW~3331.2 GB/s
+reqs=4_conv=SD           grid=(4, 80, 8)       copy/req=163.12 MiB  avg=  272.74 us  BW~5017.2 GB/s
+reqs=8_conv=SD           grid=(8, 80, 8)       copy/req=163.12 MiB  avg=  440.23 us  BW~6216.7 GB/s
+reqs=16_conv=SD          grid=(16, 80, 8)      copy/req=163.12 MiB  avg=  857.10 us  BW~6386.1 GB/s
+reqs=32_conv=SD          grid=(32, 80, 8)      copy/req=163.12 MiB  avg= 1682.88 us  BW~6505.0 GB/s
+reqs=64_conv=SD          grid=(64, 80, 8)      copy/req=163.12 MiB  avg= 3336.59 us  BW~6561.9 GB/s
+reqs=128_conv=SD         grid=(128, 80, 8)     copy/req=163.12 MiB  avg= 6640.95 us  BW~6593.7 GB/s
+
+total wall: 3.42s
