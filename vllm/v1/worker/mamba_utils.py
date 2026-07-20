@@ -16,17 +16,55 @@ from vllm.model_executor.layers.mamba.mamba_utils import (
 )
 from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import cdiv
+from vllm.utils.platform_utils import num_compute_units
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
 
-# Number of CTAs the u64 temporal body is split across (grid_z of the fused
-# postprocess/precopy kernels). 8 saturates HBM on H100/GB200 across the
-# reqs=1..128 range in the microbenchmark; small-model / small-batch cases
-# benefit most, and larger batches fold gracefully to a single wave.
-_TEMPORAL_TILES = 8
+# Bucket set for the TEMPORAL_TILES constexpr passed to the fused
+# postprocess / precopy kernels. select_temporal_tiles() floors its choice
+# to one of these values so Triton's JIT specialization cache stays at
+# most four kernels wide. Descending order for the linear search.
+_TILE_BUCKETS: tuple[int, ...] = (32, 16, 8, 1)
+
+# Target waves of temporal-copy CTAs across the SMs. Higher hides more DRAM
+# latency; too high shrinks per-tile work below the head/tail amortization
+# point. Tuned on GB200 with the 2 MiB Qwen3.5-9B temporal state.
+_TARGET_WAVES: int = 8
+
+# Minimum bytes per tile. Below ~64 KiB the head/tail scalar path and the
+# COPY_BLOCK_SIZE rounding start to dominate the u64 body.
+_MIN_TILE_BYTES: int = 64 * 1024
+
+
+def select_temporal_tiles(
+    num_reqs: int,
+    num_temporal_states: int,
+    temporal_bytes_per_block: int,
+    num_sms: int,
+) -> int:
+    """Pick ``TEMPORAL_TILES`` for the fused mamba postprocess / precopy grid.
+
+    Called at kernel invocation time so the tile count reflects the current
+    batch shape. The returned value is threaded into both ``grid_z`` and the
+    ``TEMPORAL_TILES`` constexpr, so it is floored to a bucket in
+    ``_TILE_BUCKETS`` to keep Triton's compile cache bounded.
+
+    Returns 1 on CPU / unknown backend (``num_sms == 0``) or when the grid is
+    degenerate, reproducing the untiled memcpy path.
+    """
+    if num_sms <= 0 or num_reqs <= 0 or num_temporal_states <= 0:
+        return 1
+    base = num_reqs * num_temporal_states
+    tiles_for_occupancy = cdiv(_TARGET_WAVES * num_sms, base)
+    tiles_max_by_size = max(1, temporal_bytes_per_block // _MIN_TILE_BYTES)
+    raw = max(1, min(tiles_for_occupancy, tiles_max_by_size))
+    for b in _TILE_BUCKETS:
+        if raw >= b:
+            return b
+    return 1
 
 
 @triton.jit
@@ -603,6 +641,13 @@ class MambaSpecDecodeGPUContext:
     mamba_group_ids: list[int]
     num_groups: int
 
+    # Static inputs for select_temporal_tiles(). num_sms is captured at
+    # create() time; num_temporal_states and temporal_bytes_per_block are
+    # filled in initialize_from_forward_context() once state shapes are known.
+    num_sms: int = 0
+    num_temporal_states: int = 0
+    temporal_bytes_per_block: int = 0
+
     # Output buffer for num_accepted_tokens updates
     num_accepted_tokens_out: torch.Tensor
 
@@ -643,6 +688,15 @@ class MambaSpecDecodeGPUContext:
         )
         total_states = num_layers * num_state_types
 
+        # SM count feeds select_temporal_tiles. Non-accelerator devices
+        # (e.g. CPU) return 0 here so the picker falls back to tiles=1.
+        if device.type in ("cuda", "hip", "xpu"):
+            num_sms = num_compute_units(
+                device.index if device.index is not None else 0
+            )
+        else:
+            num_sms = 0
+
         return cls(
             state_base_addrs=torch.zeros(
                 total_states, dtype=torch.int64, device=device
@@ -673,6 +727,7 @@ class MambaSpecDecodeGPUContext:
             num_state_types=num_state_types,
             mamba_group_ids=mamba_group_ids,
             num_groups=len(mamba_group_ids),
+            num_sms=num_sms,
             num_accepted_tokens_out=torch.zeros(
                 max_num_reqs, dtype=torch.int32, device=device
             ),
@@ -785,9 +840,15 @@ class MambaSpecDecodeGPUContext:
                         # state tensor is as_strided with padded page strides
                         # (state_block_stride would be the page size, too big).
                         self.state_conv_widths[idx] = 0
-                        self.state_inner_sizes[idx] = (
-                            state[0].numel() if state.dim() > 1 else 1
+                        inner = state[0].numel() if state.dim() > 1 else 1
+                        self.state_inner_sizes[idx] = inner
+                        # Cache the temporal block byte count for the tile
+                        # picker. All temporal states in a mamba model share
+                        # the same shape, so overwriting here is idempotent.
+                        self.temporal_bytes_per_block = int(inner) * int(
+                            state.element_size()
                         )
+                        self.num_temporal_states += 1
                         # Temporal copies are vectorized with uint64
                         # loads/stores; base pointer and block stride must
                         # be 8B-aligned (tail loop handles copy_size % 8).
@@ -858,7 +919,13 @@ class MambaSpecDecodeGPUContext:
         )
 
         total_states = self.num_layers * self.num_state_types
-        grid = (num_reqs, total_states, _TEMPORAL_TILES)
+        tiles = select_temporal_tiles(
+            num_reqs,
+            self.num_temporal_states,
+            self.temporal_bytes_per_block,
+            self.num_sms,
+        )
+        grid = (num_reqs, total_states, tiles)
 
         postprocess_mamba_fused_kernel[grid](
             num_accepted_tokens_gpu,
@@ -882,7 +949,7 @@ class MambaSpecDecodeGPUContext:
             block_size=self.block_size,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
-            TEMPORAL_TILES=_TEMPORAL_TILES,
+            TEMPORAL_TILES=tiles,
         )
 
     def run_fused_precopy(
@@ -906,7 +973,13 @@ class MambaSpecDecodeGPUContext:
         if num_reqs == 0 or not self.is_initialized:
             return
         total_states = self.num_layers * self.num_state_types
-        grid = (num_reqs, total_states, _TEMPORAL_TILES)
+        tiles = select_temporal_tiles(
+            num_reqs,
+            self.num_temporal_states,
+            self.temporal_bytes_per_block,
+            self.num_sms,
+        )
+        grid = (num_reqs, total_states, tiles)
         precopy_mamba_align_fused_kernel[grid](
             state_idx_gpu,
             src_col_gpu,
@@ -925,7 +998,7 @@ class MambaSpecDecodeGPUContext:
             num_reqs,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
-            TEMPORAL_TILES=_TEMPORAL_TILES,
+            TEMPORAL_TILES=tiles,
         )
 
     def run_fused_postprocess_align(
@@ -947,7 +1020,13 @@ class MambaSpecDecodeGPUContext:
         if num_reqs == 0 or not self.is_initialized:
             return
         total_states = self.num_layers * self.num_state_types
-        grid = (num_reqs, total_states, _TEMPORAL_TILES)
+        tiles = select_temporal_tiles(
+            num_reqs,
+            self.num_temporal_states,
+            self.temporal_bytes_per_block,
+            self.num_sms,
+        )
+        grid = (num_reqs, total_states, tiles)
         postprocess_mamba_fused_kernel[grid](
             num_accepted_tokens_gpu,
             state_idx_gpu,
@@ -972,7 +1051,7 @@ class MambaSpecDecodeGPUContext:
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
             HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
-            TEMPORAL_TILES=_TEMPORAL_TILES,
+            TEMPORAL_TILES=tiles,
         )
 
 

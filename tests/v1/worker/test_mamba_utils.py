@@ -21,6 +21,7 @@ from vllm.v1.worker.mamba_utils import (
     collect_mamba_copy_meta,
     do_mamba_copy_block,
     preprocess_mamba,
+    select_temporal_tiles,
 )
 
 MambaStateCopyFunc = Callable[..., Any]
@@ -2247,3 +2248,71 @@ class TestPostprocessMambaFusedKernel:
             gpu_ctx_sd.num_accepted_tokens_out[:num_reqs],
             msg="DS num_accepted_tokens diverged from SD",
         )
+
+
+# ---------------------------------------------------------------------------
+# select_temporal_tiles: pure Python, no GPU needed. Table-driven so tuning
+# knobs and boundary rounding stay auditable.
+# ---------------------------------------------------------------------------
+
+
+# GB200-class device, Qwen3.5-9B temporal state (24 temporal states, 2 MiB/block).
+# With _TARGET_WAVES=8 and buckets (32, 16, 8, 1), base cases:
+#   reqs=1   -> cdiv(8*148, 24)  = 50 -> min(50, 32) = 32 -> bucket 32
+#   reqs=4   -> cdiv(8*148, 96)  = 13 -> min(13, 32) = 13 -> bucket 8
+#   reqs=32  -> cdiv(8*148, 768) = 2  -> min(2, 32)  = 2  -> bucket 1
+#   reqs=128 -> cdiv(8*148, 3072)= 1  -> min(1, 32)  = 1  -> bucket 1
+@pytest.mark.parametrize(
+    "num_reqs, num_temporal_states, temporal_bytes_per_block, num_sms, expected",
+    [
+        # GB200-ish (148 SMs), Qwen3.5-9B (24 temporal, 2 MiB/block)
+        (1, 24, 2 * 1024 * 1024, 148, 32),
+        (4, 24, 2 * 1024 * 1024, 148, 8),
+        (32, 24, 2 * 1024 * 1024, 148, 1),
+        (128, 24, 2 * 1024 * 1024, 148, 1),
+        # CPU / unknown backend: num_sms=0 always yields tiles=1.
+        (1, 24, 2 * 1024 * 1024, 0, 1),
+        (128, 24, 2 * 1024 * 1024, 0, 1),
+        # Degenerate inputs: num_reqs=0 or num_temporal_states=0 -> tiles=1.
+        (0, 24, 2 * 1024 * 1024, 148, 1),
+        (1, 0, 2 * 1024 * 1024, 148, 1),
+        # Small temporal block (256 KiB) caps by size: max_by_size = 4 -> bucket 1.
+        (1, 24, 256 * 1024, 148, 1),
+        # Larger temporal block (4 MiB Nemotron-like): size cap = 64 leaves
+        # headroom; wider 40-state grid drops occupancy to raw=30, which
+        # lands in the middle bucket 16.
+        (1, 40, 4 * 1024 * 1024, 148, 16),
+    ],
+)
+def test_select_temporal_tiles_table(
+    num_reqs,
+    num_temporal_states,
+    temporal_bytes_per_block,
+    num_sms,
+    expected,
+):
+    got = select_temporal_tiles(
+        num_reqs,
+        num_temporal_states,
+        temporal_bytes_per_block,
+        num_sms,
+    )
+    assert got == expected, (
+        f"select_temporal_tiles({num_reqs}, {num_temporal_states}, "
+        f"{temporal_bytes_per_block}, {num_sms}) = {got}, expected {expected}"
+    )
+
+
+def test_select_temporal_tiles_returns_bucketed_value():
+    """The picker only ever returns a value present in the bucket set."""
+    from vllm.v1.worker.mamba_utils import _TILE_BUCKETS
+
+    for num_reqs in (1, 2, 3, 7, 16, 100):
+        for num_sms in (0, 1, 32, 128, 256):
+            for temporal_bytes in (32 * 1024, 512 * 1024, 8 * 1024 * 1024):
+                got = select_temporal_tiles(
+                    num_reqs, 24, temporal_bytes, num_sms
+                )
+                assert got in _TILE_BUCKETS, (
+                    f"picker returned {got}, not in {_TILE_BUCKETS}"
+                )

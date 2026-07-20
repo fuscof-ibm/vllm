@@ -14,7 +14,7 @@ copy_size]`` slice copy for every combination of:
 * Sub-8B alignment offsets on ``src`` and ``dst`` (independent), covering
   head=0/1/3/5/7 bytes and every src/dst sub-alignment mismatch.
 * ``NUM_TILES`` values used at the callsites (1 for the SD conv path;
-  ``_TEMPORAL_TILES`` for the temporal path) and a few extras that stress
+  the picker output for the temporal path) and a few extras that stress
   the tile boundary rounding.
 """
 
@@ -75,8 +75,8 @@ _COPY_SIZES = [0, 1, 7, 8, 15, 16, 17, 1024, 80 * 1024, 4 * 1024 * 1024]
 # Sub-8B alignment offsets. torch tensors are 256B-aligned at data_ptr, so
 # slicing by these values yields a controlled sub-8B alignment.
 _ALIGN_OFFS = [0, 1, 3, 5, 7]
-# NUM_TILES: 1 matches the SD conv callsite, 8 matches _TEMPORAL_TILES, 16
-# stresses tile-boundary rounding when body_u64 is small.
+# NUM_TILES: 1 matches the SD conv callsite, 8 covers a common picker bucket,
+# and 16 stresses tile-boundary rounding when body_u64 is small.
 _NUM_TILES = [1, 2, 4, 8, 16]
 
 
