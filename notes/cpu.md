@@ -56,6 +56,24 @@ From `main (b3cfca99)`
 (EngineCore pid=1473934) ERROR 07-13 11:28:14 [core.py:1242] RuntimeError: Worker failed with error 'module 'triton' has no attribute 'next_power_of_2'', please check the stack trace above for the root cause
 ```
 
+How to check the `last_precompiled_cpu.sh`:
+
+```
+#!/bin/bash
+
+CPU_META=$(curl -sfL "https://wheels.vllm.ai/nightly/cpu/vllm/metadata.json")
+CPU_COMMIT=$(echo "$CPU_META" | python -c "
+import json, sys, re
+wheels = json.load(sys.stdin)
+for w in wheels:
+    v = w.get('version', '')
+    m = re.search(r'\+g([0-9a-f]{7,40})', v)
+    if m:
+        print(m.group(1)); break
+")
+echo "Latest precompiled CPU wheel commit: $CPU_COMMIT"
+```
+
 
 # To see
 
