@@ -1,0 +1,81 @@
+----------------------------------------------------------------------------------------------------
+MAIN
+----------------------------------------------------------------------------------------------------
+
+# python3 benchmarks/bench_copy_mamba_state_block.py --model Qwen/Qwen3.5-9B
+device: NVIDIA GB200
+model: Qwen/Qwen3.5-9B (gated_delta_net) tp=1 num_spec=2
+state_layers=24 state_types=2 total_states=48  # 24 linear + 8 full_attention (interval 4) out of 32
+conv: dim=8192 state_len=5 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(32, 128, 128) inner=524288 dtype=torch.float32 (=2.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 48)          copy/req= 49.88 MiB  avg=  178.58 us  BW~ 585.7 GB/s
+reqs=4_conv=SD           grid=(4, 48)          copy/req= 49.88 MiB  avg=  201.78 us  BW~2073.5 GB/s
+reqs=8_conv=SD           grid=(8, 48)          copy/req= 49.88 MiB  avg=  231.78 us  BW~3610.2 GB/s
+reqs=16_conv=SD          grid=(16, 48)         copy/req= 49.88 MiB  avg=  312.20 us  BW~5360.5 GB/s
+reqs=32_conv=SD          grid=(32, 48)         copy/req= 49.88 MiB  avg=  531.92 us  BW~6292.4 GB/s
+reqs=64_conv=SD          grid=(64, 48)         copy/req= 49.88 MiB  avg= 1129.67 us  BW~5925.7 GB/s
+reqs=128_conv=SD         grid=(128, 48)        copy/req= 49.88 MiB  avg= 2153.65 us  BW~6216.5 GB/s
+
+total wall: 1.61s
+
+
+# python3 benchmarks/bench_copy_mamba_state_block.py --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+device: NVIDIA GB200
+model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (mamba2) tp=1 num_spec=1
+state_layers=40 state_types=2 total_states=80  # 40 mamba + 8 attention + 40 moe out of 88
+conv: dim=10240 state_len=4 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(128, 64, 128) inner=1048576 dtype=torch.float32 (=4.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 80)          copy/req=163.12 MiB  avg=  360.15 us  BW~ 949.9 GB/s
+reqs=4_conv=SD           grid=(4, 80)          copy/req=163.12 MiB  avg=  440.41 us  BW~3107.1 GB/s
+reqs=8_conv=SD           grid=(8, 80)          copy/req=163.12 MiB  avg=  556.40 us  BW~4918.8 GB/s
+reqs=16_conv=SD          grid=(16, 80)         copy/req=163.12 MiB  avg=  838.95 us  BW~6524.3 GB/s
+reqs=32_conv=SD          grid=(32, 80)         copy/req=163.12 MiB  avg= 1890.63 us  BW~5790.2 GB/s
+reqs=64_conv=SD          grid=(64, 80)         copy/req=163.12 MiB  avg= 3495.56 us  BW~6263.5 GB/s
+reqs=128_conv=SD         grid=(128, 80)        copy/req=163.12 MiB  avg= 6933.71 us  BW~6315.3 GB/s
+
+total wall: 3.69s
+
+----------------------------------------------------------------------------------------------------
+PR
+----------------------------------------------------------------------------------------------------
+
+#python3 benchmarks/bench_copy_mamba_state_block.py --model Qwen/Qwen3.5-9B
+device: NVIDIA GB200
+model: Qwen/Qwen3.5-9B (gated_delta_net) tp=1 num_spec=2
+state_layers=24 state_types=2 total_states=48  # 24 linear + 8 full_attention (interval 4) out of 32
+conv: dim=8192 state_len=5 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(32, 128, 128) inner=524288 dtype=torch.float32 (=2.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 48, 16)      copy/req= 49.88 MiB  avg=   23.15 us  BW~4519.1 GB/s
+reqs=4_conv=SD           grid=(4, 48, 16)      copy/req= 49.88 MiB  avg=   73.61 us  BW~5683.7 GB/s
+reqs=8_conv=SD           grid=(8, 48, 16)      copy/req= 49.88 MiB  avg=  133.55 us  BW~6265.6 GB/s
+reqs=16_conv=SD          grid=(16, 48, 16)     copy/req= 49.88 MiB  avg=  256.62 us  BW~6521.5 GB/s
+reqs=32_conv=SD          grid=(32, 48, 16)     copy/req= 49.88 MiB  avg=  502.58 us  BW~6659.7 GB/s
+reqs=64_conv=SD          grid=(64, 48, 16)     copy/req= 49.88 MiB  avg=  997.11 us  BW~6713.5 GB/s
+reqs=128_conv=SD         grid=(128, 48, 16)    copy/req= 49.88 MiB  avg= 1983.94 us  BW~6748.3 GB/s
+
+total wall: 2.02s
+
+#python3 benchmarks/bench_copy_mamba_state_block.py --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+device: NVIDIA GB200
+model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (mamba2) tp=1 num_spec=1
+state_layers=40 state_types=2 total_states=80  # 40 mamba + 8 attention + 40 moe out of 88
+conv: dim=10240 state_len=4 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(128, 64, 128) inner=1048576 dtype=torch.float32 (=4.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 80, 16)      copy/req=163.12 MiB  avg=   59.59 us  BW~5740.9 GB/s
+reqs=4_conv=SD           grid=(4, 80, 16)      copy/req=163.12 MiB  avg=  216.52 us  BW~6320.0 GB/s
+reqs=8_conv=SD           grid=(8, 80, 16)      copy/req=163.12 MiB  avg=  420.74 us  BW~6504.7 GB/s
+reqs=16_conv=SD          grid=(16, 80, 16)     copy/req=163.12 MiB  avg=  827.17 us  BW~6617.2 GB/s
+reqs=32_conv=SD          grid=(32, 80, 16)     copy/req=163.12 MiB  avg= 1641.31 us  BW~6669.8 GB/s
+reqs=64_conv=SD          grid=(64, 80, 16)     copy/req=163.12 MiB  avg= 3271.35 us  BW~6692.7 GB/s
+reqs=128_conv=SD         grid=(128, 80, 16)    copy/req=163.12 MiB  avg= 6532.82 us  BW~6702.9 GB/s
+
+total wall: 3.35s
+
