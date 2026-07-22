@@ -1,0 +1,149 @@
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# python3 benchmarks/bench_copy_mamba_state_block_tiled.py --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+device: NVIDIA GB200
+model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (mamba2) tp=1 num_spec=1
+state_layers=40 state_types=2 total_states=80  # 40 mamba + 8 attention + 40 moe out of 88
+conv: dim=10240 state_len=4 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(128, 64, 128) inner=1048576 dtype=torch.float32 (=4.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 80, 1)       copy/req=163.12 MiB  avg=  360.13 us  BW~ 949.9 GB/s
+reqs=4_conv=SD           grid=(4, 80, 1)       copy/req=163.12 MiB  avg=  441.70 us  BW~3098.0 GB/s
+reqs=8_conv=SD           grid=(8, 80, 1)       copy/req=163.12 MiB  avg=  557.41 us  BW~4909.8 GB/s
+reqs=16_conv=SD          grid=(16, 80, 1)      copy/req=163.12 MiB  avg=  845.15 us  BW~6476.5 GB/s
+reqs=32_conv=SD          grid=(32, 80, 1)      copy/req=163.12 MiB  avg= 1821.14 us  BW~6011.1 GB/s
+reqs=64_conv=SD          grid=(64, 80, 1)      copy/req=163.12 MiB  avg= 3415.14 us  BW~6410.9 GB/s
+reqs=128_conv=SD         grid=(128, 80, 1)     copy/req=163.12 MiB  avg= 6769.71 us  BW~6468.3 GB/s
+
+total wall: 4.28s
+
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# python3 benchmarks/bench_copy_mamba_state_block_tiled.py --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+device: NVIDIA GB200
+model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (mamba2) tp=1 num_spec=1
+state_layers=40 state_types=2 total_states=80  # 40 mamba + 8 attention + 40 moe out of 88
+conv: dim=10240 state_len=4 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(128, 64, 128) inner=1048576 dtype=torch.float32 (=4.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 80, 8)       copy/req=163.12 MiB  avg=   75.94 us  BW~4505.0 GB/s
+reqs=4_conv=SD           grid=(4, 80, 8)       copy/req=163.12 MiB  avg=  234.46 us  BW~5836.5 GB/s
+reqs=8_conv=SD           grid=(8, 80, 8)       copy/req=163.12 MiB  avg=  429.59 us  BW~6370.7 GB/s
+reqs=16_conv=SD          grid=(16, 80, 8)      copy/req=163.12 MiB  avg=  839.79 us  BW~6517.8 GB/s
+reqs=32_conv=SD          grid=(32, 80, 8)      copy/req=163.12 MiB  avg= 1660.22 us  BW~6593.8 GB/s
+reqs=64_conv=SD          grid=(64, 80, 8)      copy/req=163.12 MiB  avg= 3303.39 us  BW~6627.8 GB/s
+reqs=128_conv=SD         grid=(128, 80, 8)     copy/req=163.12 MiB  avg= 6587.05 us  BW~6647.7 GB/s
+
+total wall: 3.57s
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# vim benchmarks/bench_copy_mamba_state_block_tiled.py
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# python3 benchmarks/bench_copy_mamba_state_block_tiled.py --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+device: NVIDIA GB200
+model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (mamba2) tp=1 num_spec=1
+state_layers=40 state_types=2 total_states=80  # 40 mamba + 8 attention + 40 moe out of 88
+conv: dim=10240 state_len=4 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(128, 64, 128) inner=1048576 dtype=torch.float32 (=4.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 80, 16)      copy/req=163.12 MiB  avg=   59.59 us  BW~5740.7 GB/s
+reqs=4_conv=SD           grid=(4, 80, 16)      copy/req=163.12 MiB  avg=  216.62 us  BW~6317.1 GB/s
+reqs=8_conv=SD           grid=(8, 80, 16)      copy/req=163.12 MiB  avg=  419.95 us  BW~6517.0 GB/s
+reqs=16_conv=SD          grid=(16, 80, 16)     copy/req=163.12 MiB  avg=  826.78 us  BW~6620.4 GB/s
+reqs=32_conv=SD          grid=(32, 80, 16)     copy/req=163.12 MiB  avg= 1641.90 us  BW~6667.4 GB/s
+reqs=64_conv=SD          grid=(64, 80, 16)     copy/req=163.12 MiB  avg= 3272.84 us  BW~6689.7 GB/s
+reqs=128_conv=SD         grid=(128, 80, 16)    copy/req=163.12 MiB  avg= 6535.73 us  BW~6699.9 GB/s
+
+total wall: 3.35s
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# jobs
+[1]+  Stopped                 vim benchmarks/bench_copy_mamba_state_block_tiled.py
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# fg % 1
+vim benchmarks/bench_copy_mamba_state_block_tiled.py
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# python3 benchmarks/bench_copy_mamba_state_block_tiled.py --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+device: NVIDIA GB200
+model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (mamba2) tp=1 num_spec=1
+state_layers=40 state_types=2 total_states=80  # 40 mamba + 8 attention + 40 moe out of 88
+conv: dim=10240 state_len=4 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(128, 64, 128) inner=1048576 dtype=torch.float32 (=4.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 80, 32)      copy/req=163.12 MiB  avg=   62.20 us  BW~5500.0 GB/s
+reqs=4_conv=SD           grid=(4, 80, 32)      copy/req=163.12 MiB  avg=  212.32 us  BW~6445.0 GB/s
+reqs=8_conv=SD           grid=(8, 80, 32)      copy/req=163.12 MiB  avg=  414.05 us  BW~6609.8 GB/s
+reqs=16_conv=SD          grid=(16, 80, 32)     copy/req=163.12 MiB  avg=  815.69 us  BW~6710.4 GB/s
+reqs=32_conv=SD          grid=(32, 80, 32)     copy/req=163.12 MiB  avg= 1624.87 us  BW~6737.2 GB/s
+reqs=64_conv=SD          grid=(64, 80, 32)     copy/req=163.12 MiB  avg= 3242.79 us  BW~6751.7 GB/s
+reqs=128_conv=SD         grid=(128, 80, 32)    copy/req=163.12 MiB  avg= 6475.53 us  BW~6762.2 GB/s
+
+total wall: 3.34s
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# jobs
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# fg % 1
+bash: fg: %: no such job
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# vim benchmarks/bench_copy_mamba_state_block_tiled.py
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# python3 benchmarks/bench_copy_mamba_state_block_tiled.py 
+device: NVIDIA GB200
+model: Qwen/Qwen3.5-9B (gated_delta_net) tp=1 num_spec=2
+state_layers=24 state_types=2 total_states=48  # 24 linear + 8 full_attention (interval 4) out of 32
+conv: dim=8192 state_len=5 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(32, 128, 128) inner=524288 dtype=torch.float32 (=2.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 48, 1)       copy/req= 49.88 MiB  avg=  178.32 us  BW~ 586.6 GB/s
+reqs=4_conv=SD           grid=(4, 48, 1)       copy/req= 49.88 MiB  avg=  201.60 us  BW~2075.3 GB/s
+reqs=8_conv=SD           grid=(8, 48, 1)       copy/req= 49.88 MiB  avg=  232.02 us  BW~3606.5 GB/s
+reqs=16_conv=SD          grid=(16, 48, 1)      copy/req= 49.88 MiB  avg=  312.16 us  BW~5361.2 GB/s
+reqs=32_conv=SD          grid=(32, 48, 1)      copy/req= 49.88 MiB  avg=  531.96 us  BW~6291.9 GB/s
+reqs=64_conv=SD          grid=(64, 48, 1)      copy/req= 49.88 MiB  avg= 1092.71 us  BW~6126.2 GB/s
+reqs=128_conv=SD         grid=(128, 48, 1)     copy/req= 49.88 MiB  avg= 2102.29 us  BW~6368.4 GB/s
+
+total wall: 1.51s
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# python3 benchmarks/bench_copy_mamba_state_block_tiled.py
+device: NVIDIA GB200
+model: Qwen/Qwen3.5-9B (gated_delta_net) tp=1 num_spec=2
+state_layers=24 state_types=2 total_states=48  # 24 linear + 8 full_attention (interval 4) out of 32
+conv: dim=8192 state_len=5 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(32, 128, 128) inner=524288 dtype=torch.float32 (=2.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 48, 8)       copy/req= 49.88 MiB  avg=   32.78 us  BW~3191.2 GB/s
+reqs=4_conv=SD           grid=(4, 48, 8)       copy/req= 49.88 MiB  avg=   72.37 us  BW~5781.5 GB/s
+reqs=8_conv=SD           grid=(8, 48, 8)       copy/req= 49.88 MiB  avg=  140.21 us  BW~5968.0 GB/s
+reqs=16_conv=SD          grid=(16, 48, 8)      copy/req= 49.88 MiB  avg=  261.50 us  BW~6399.8 GB/s
+reqs=32_conv=SD          grid=(32, 48, 8)      copy/req= 49.88 MiB  avg=  510.22 us  BW~6560.0 GB/s
+reqs=64_conv=SD          grid=(64, 48, 8)      copy/req= 49.88 MiB  avg= 1009.17 us  BW~6633.3 GB/s
+reqs=128_conv=SD         grid=(128, 48, 8)     copy/req= 49.88 MiB  avg= 2005.44 us  BW~6675.9 GB/s
+
+total wall: 1.34s
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# vim benchmarks/bench_copy_mamba_state_block_tiled.py
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# python3 benchmarks/bench_copy_mamba_state_block_tiled.py
+device: NVIDIA GB200
+model: Qwen/Qwen3.5-9B (gated_delta_net) tp=1 num_spec=2
+state_layers=24 state_types=2 total_states=48  # 24 linear + 8 full_attention (interval 4) out of 32
+conv: dim=8192 state_len=5 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(32, 128, 128) inner=524288 dtype=torch.float32 (=2.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 48, 16)      copy/req= 49.88 MiB  avg=   22.99 us  BW~4550.3 GB/s
+reqs=4_conv=SD           grid=(4, 48, 16)      copy/req= 49.88 MiB  avg=   73.28 us  BW~5709.2 GB/s
+reqs=8_conv=SD           grid=(8, 48, 16)      copy/req= 49.88 MiB  avg=  134.25 us  BW~6232.7 GB/s
+reqs=16_conv=SD          grid=(16, 48, 16)     copy/req= 49.88 MiB  avg=  256.45 us  BW~6525.8 GB/s
+reqs=32_conv=SD          grid=(32, 48, 16)     copy/req= 49.88 MiB  avg=  502.40 us  BW~6662.2 GB/s
+reqs=64_conv=SD          grid=(64, 48, 16)     copy/req= 49.88 MiB  avg=  997.38 us  BW~6711.7 GB/s
+reqs=128_conv=SD         grid=(128, 48, 16)    copy/req= 49.88 MiB  avg= 1984.33 us  BW~6747.0 GB/s
+
+total wall: 1.34s
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# vim benchmarks/bench_copy_mamba_state_block_tiled.py
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm# python3 benchmarks/bench_copy_mamba_state_block_tiled.py
+device: NVIDIA GB200
+model: Qwen/Qwen3.5-9B (gated_delta_net) tp=1 num_spec=2
+state_layers=24 state_types=2 total_states=48  # 24 linear + 8 full_attention (interval 4) out of 32
+conv: dim=8192 state_len=5 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(32, 128, 128) inner=524288 dtype=torch.float32 (=2.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 48, 32)      copy/req= 49.88 MiB  avg=   20.60 us  BW~5076.3 GB/s
+reqs=4_conv=SD           grid=(4, 48, 32)      copy/req= 49.88 MiB  avg=   69.21 us  BW~6045.3 GB/s
+reqs=8_conv=SD           grid=(8, 48, 32)      copy/req= 49.88 MiB  avg=  129.68 us  BW~6452.7 GB/s
+reqs=16_conv=SD          grid=(16, 48, 32)     copy/req= 49.88 MiB  avg=  251.92 us  BW~6643.2 GB/s
+reqs=32_conv=SD          grid=(32, 48, 32)     copy/req= 49.88 MiB  avg=  495.87 us  BW~6749.8 GB/s
+reqs=64_conv=SD          grid=(64, 48, 32)     copy/req= 49.88 MiB  avg=  985.57 us  BW~6792.1 GB/s
+reqs=128_conv=SD         grid=(128, 48, 32)    copy/req= 49.88 MiB  avg= 1967.22 us  BW~6805.6 GB/s
+
+total wall: 1.45s
+(vllm-dev) root@slurm-gb200-223-079:/mnt/home/fuscof/vllm#
