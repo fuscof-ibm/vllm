@@ -1,0 +1,117 @@
+(venv_cuda) ffu@css-host-183:~/opensources-ibm/vllm$ python3 benchmarks/bench_copy_mamba_state_block.py --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+device: NVIDIA H100 80GB HBM3
+model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (mamba2) tp=1 num_spec=1
+state_layers=40 state_types=2 total_states=80  # 40 mamba + 8 attention + 40 moe out of 88
+conv: dim=10240 state_len=4 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(128, 64, 128) inner=1048576 dtype=torch.float32 (=4.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 80, 8)       copy/req=163.12 MiB  avg=  123.99 us  BW~2759.1 GB/s
+reqs=4_conv=SD           grid=(4, 80, 8)       copy/req=163.12 MiB  avg=  490.10 us  BW~2792.1 GB/s
+reqs=8_conv=SD           grid=(8, 80, 8)       copy/req=163.12 MiB  avg=  953.94 us  BW~2868.9 GB/s
+reqs=16_conv=SD          grid=(16, 80, 8)      copy/req=163.12 MiB  avg= 1893.29 us  BW~2891.0 GB/s
+reqs=32_conv=SD          grid=(32, 80, 8)      copy/req=163.12 MiB  avg= 3773.94 us  BW~2900.7 GB/s
+reqs=64_conv=SD          grid=(64, 80, 8)      copy/req=163.12 MiB  avg= 7534.21 us  BW~2906.0 GB/s
+reqs=128_conv=SD         grid=(128, 80, 8)     copy/req=163.12 MiB  avg=15054.14 us  BW~2908.7 GB/s
+
+total wall: 7.02s
+(venv_cuda) ffu@css-host-183:~/opensources-ibm/vllm$ vim benchmarks/bench_copy_mamba_state_block.py
+(venv_cuda) ffu@css-host-183:~/opensources-ibm/vllm$ python3 benchmarks/bench_copy_mamba_state_block.py --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+device: NVIDIA H100 80GB HBM3
+model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (mamba2) tp=1 num_spec=1
+state_layers=40 state_types=2 total_states=80  # 40 mamba + 8 attention + 40 moe out of 88
+conv: dim=10240 state_len=4 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(128, 64, 128) inner=1048576 dtype=torch.float32 (=4.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 80, 16)      copy/req=163.12 MiB  avg=  129.10 us  BW~2649.8 GB/s
+reqs=4_conv=SD           grid=(4, 80, 16)      copy/req=163.12 MiB  avg=  479.23 us  BW~2855.4 GB/s
+reqs=8_conv=SD           grid=(8, 80, 16)      copy/req=163.12 MiB  avg=  948.53 us  BW~2885.3 GB/s
+reqs=16_conv=SD          grid=(16, 80, 16)     copy/req=163.12 MiB  avg= 1888.77 us  BW~2898.0 GB/s
+reqs=32_conv=SD          grid=(32, 80, 16)     copy/req=163.12 MiB  avg= 3765.12 us  BW~2907.5 GB/s
+reqs=64_conv=SD          grid=(64, 80, 16)     copy/req=163.12 MiB  avg= 7522.80 us  BW~2910.4 GB/s
+reqs=128_conv=SD         grid=(128, 80, 16)    copy/req=163.12 MiB  avg=15034.68 us  BW~2912.5 GB/s
+
+total wall: 7.01s
+(venv_cuda) ffu@css-host-183:~/opensources-ibm/vllm$ vim benchmarks/bench_copy_mamba_state_block.py
+(venv_cuda) ffu@css-host-183:~/opensources-ibm/vllm$ python3 benchmarks/bench_copy_mamba_state_block.py --model nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4
+device: NVIDIA H100 80GB HBM3
+model: nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4 (mamba2) tp=1 num_spec=1
+state_layers=40 state_types=2 total_states=80  # 40 mamba + 8 attention + 40 moe out of 88
+conv: dim=10240 state_len=4 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(128, 64, 128) inner=1048576 dtype=torch.float32 (=4.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 80, 32)      copy/req=163.12 MiB  avg=  126.60 us  BW~2702.2 GB/s
+reqs=4_conv=SD           grid=(4, 80, 32)      copy/req=163.12 MiB  avg=  475.72 us  BW~2876.5 GB/s
+reqs=8_conv=SD           grid=(8, 80, 32)      copy/req=163.12 MiB  avg=  944.63 us  BW~2897.2 GB/s
+reqs=16_conv=SD          grid=(16, 80, 32)     copy/req=163.12 MiB  avg= 1886.53 us  BW~2901.4 GB/s
+reqs=32_conv=SD          grid=(32, 80, 32)     copy/req=163.12 MiB  avg= 3761.84 us  BW~2910.0 GB/s
+reqs=64_conv=SD          grid=(64, 80, 32)     copy/req=163.12 MiB  avg= 7514.60 us  BW~2913.6 GB/s
+reqs=128_conv=SD         grid=(128, 80, 32)    copy/req=163.12 MiB  avg=15014.87 us  BW~2916.3 GB/s
+
+total wall: 7.00s
+
+
+(venv_cuda) ffu@css-host-183:~/opensources-ibm/vllm$ python3 benchmarks/bench_copy_mamba_state_block.py
+device: NVIDIA H100 80GB HBM3
+model: Qwen/Qwen3.5-9B (gated_delta_net) tp=1 num_spec=2
+state_layers=24 state_types=2 total_states=48  # 24 linear + 8 full_attention (interval 4) out of 32
+conv: dim=8192 state_len=5 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(32, 128, 128) inner=524288 dtype=torch.float32 (=2.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 48, 8)       copy/req= 49.88 MiB  avg=   47.38 us  BW~2207.6 GB/s
+reqs=4_conv=SD           grid=(4, 48, 8)       copy/req= 49.88 MiB  avg=  157.14 us  BW~2662.4 GB/s
+reqs=8_conv=SD           grid=(8, 48, 8)       copy/req= 49.88 MiB  avg=  298.37 us  BW~2804.5 GB/s
+reqs=16_conv=SD          grid=(16, 48, 8)      copy/req= 49.88 MiB  avg=  584.66 us  BW~2862.4 GB/s
+reqs=32_conv=SD          grid=(32, 48, 8)      copy/req= 49.88 MiB  avg= 1159.36 us  BW~2887.0 GB/s
+reqs=64_conv=SD          grid=(64, 48, 8)      copy/req= 49.88 MiB  avg= 2305.93 us  BW~2903.0 GB/s
+reqs=128_conv=SD         grid=(128, 48, 8)     copy/req= 49.88 MiB  avg= 4602.86 us  BW~2908.7 GB/s
+
+total wall: 2.41s
+(venv_cuda) ffu@css-host-183:~/opensources-ibm/vllm$ vim benchmarks/bench_copy_mamba_state_block.py
+(venv_cuda) ffu@css-host-183:~/opensources-ibm/vllm$ python3 benchmarks/bench_copy_mamba_state_block.py
+device: NVIDIA H100 80GB HBM3
+model: Qwen/Qwen3.5-9B (gated_delta_net) tp=1 num_spec=2
+state_layers=24 state_types=2 total_states=48  # 24 linear + 8 full_attention (interval 4) out of 32
+conv: dim=8192 state_len=5 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(32, 128, 128) inner=524288 dtype=torch.float32 (=2.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 48, 16)      copy/req= 49.88 MiB  avg=   41.64 us  BW~2511.9 GB/s
+reqs=4_conv=SD           grid=(4, 48, 16)      copy/req= 49.88 MiB  avg=  152.01 us  BW~2752.4 GB/s
+reqs=8_conv=SD           grid=(8, 48, 16)      copy/req= 49.88 MiB  avg=  293.69 us  BW~2849.1 GB/s
+reqs=16_conv=SD          grid=(16, 48, 16)     copy/req= 49.88 MiB  avg=  583.86 us  BW~2866.3 GB/s
+reqs=32_conv=SD          grid=(32, 48, 16)     copy/req= 49.88 MiB  avg= 1155.12 us  BW~2897.6 GB/s
+reqs=64_conv=SD          grid=(64, 48, 16)     copy/req= 49.88 MiB  avg= 2302.49 us  BW~2907.3 GB/s
+reqs=128_conv=SD         grid=(128, 48, 16)    copy/req= 49.88 MiB  avg= 4595.83 us  BW~2913.1 GB/s
+
+total wall: 2.94s
+(venv_cuda) ffu@css-host-183:~/opensources-ibm/vllm$ vim benchmarks/bench_copy_mamba_state_block.py
+(venv_cuda) ffu@css-host-183:~/opensources-ibm/vllm$ python3 benchmarks/bench_copy_mamba_state_block.py
+device: NVIDIA H100 80GB HBM3
+model: Qwen/Qwen3.5-9B (gated_delta_net) tp=1 num_spec=2
+state_layers=24 state_types=2 total_states=48  # 24 linear + 8 full_attention (interval 4) out of 32
+conv: dim=8192 state_len=5 dtype=torch.bfloat16 (=80.0 KiB/block)
+temporal: shape=(32, 128, 128) inner=524288 dtype=torch.float32 (=2.00 MiB/block)
+iters warmup=20 timed=200
+
+reqs=1_conv=SD           grid=(1, 48, 32)      copy/req= 49.88 MiB  avg=   42.78 us  BW~2444.7 GB/s
+reqs=4_conv=SD           grid=(4, 48, 32)      copy/req= 49.88 MiB  avg=  150.22 us  BW~2785.2 GB/s
+reqs=8_conv=SD           grid=(8, 48, 32)      copy/req= 49.88 MiB  avg=  294.46 us  BW~2841.7 GB/s
+reqs=16_conv=SD          grid=(16, 48, 32)     copy/req= 49.88 MiB  avg=  585.43 us  BW~2858.6 GB/s
+reqs=32_conv=SD          grid=(32, 48, 32)     copy/req= 49.88 MiB  avg= 1153.69 us  BW~2901.2 GB/s
+reqs=64_conv=SD          grid=(64, 48, 32)     copy/req= 49.88 MiB  avg= 2315.65 us  BW~2890.8 GB/s
+reqs=128_conv=SD         grid=(128, 48, 32)    copy/req= 49.88 MiB  avg= 4606.34 us  BW~2906.5 GB/s
+
+total wall: 2.88s
+
+   vllm serve \
+       --model Qwen/Qwen3.5-9B \
+       -tp 1 -pp 1 -dp 1 \
+       --language-model-only \
+       --reasoning-parser qwen3 \
+       --speculative-config '{"method":"qwen3_next_mtp","num_speculative_tokens":2}'
+   ```
+
