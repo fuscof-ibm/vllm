@@ -270,8 +270,18 @@ def postprocess_mamba_fused_kernel(
     # DS conv row metadata. Zero keeps the single-region copy path.
     state_dim_row_count_ptr,  # int32: per-block dim row count for DS conv
     state_dim_row_stride_ptr,  # int64: bytes between rows for DS conv
-    # Output: num_accepted_tokens update (for src==dst case)
+    # Output: num_accepted_tokens update (for src==dst case). Under
+    # HAS_IDX_MAPPING=False (V1), this is the req-slot-indexed output buffer
+    # that receives the reset value 1. Under HAS_IDX_MAPPING=True (V2), a
+    # batch-indexed reset flag buffer is written to ``reset_flags_out_ptr``
+    # instead, so this parameter is ignored.
     num_accepted_tokens_out_ptr,
+    # V2 align path only: batch-indexed int8 reset flag buffer. Written by the
+    # (state_idx == 0, tile_idx == 0) CTA for each batch row; consumed by a
+    # separate scatter kernel that applies the reset back into the slot-indexed
+    # ``num_accepted_tokens`` buffer. Writing per unique batch_idx removes the
+    # cross-CTA aliased write that the in-place reset previously introduced.
+    reset_flags_out_ptr,
     # Optional: batch_idx -> req_idx mapping (V2 model runner / PP). The
     # per-request decision arrays are in req-state-slot order; the block table
     # is in batch order, so HAS_IDX_MAPPING splits the two indexings.
@@ -349,14 +359,18 @@ def postprocess_mamba_fused_kernel(
     accept_token_bias = aligned_new_computed - num_tokens_running_state
     dest_block_idx = aligned_new_computed // block_size - 1
 
-    # Update accepted-token count before early exits (per-request, so only
-    # state_idx == 0 writes). V2 updates in place; V1 writes the _out buffer.
-    # Also guard on tile_idx == 0 so tiles > 0 (when TEMPORAL_TILES > 1) do
-    # not duplicate the store.
-    if src_block_idx == dest_block_idx and state_idx == 0 and tile_idx == 0:
+    # Emit the per-request reset decision before early exits. Only the
+    # (state_idx == 0, tile_idx == 0) CTA writes; tiles > 0 must not duplicate.
+    # V1 writes the reset value directly into the req-slot-indexed _out buffer.
+    # V2 writes a batch-indexed reset flag; a follow-up scatter kernel then
+    # applies the reset. This split avoids the cross-CTA aliased write on
+    # ``num_accepted_tokens_ptr`` that other CTAs also load from at the top of
+    # the kernel (CUDA has no cross-CTA ordering guarantee within a launch).
+    if state_idx == 0 and tile_idx == 0:
+        should_reset = src_block_idx == dest_block_idx
         if HAS_IDX_MAPPING:
-            tl.store(num_accepted_tokens_ptr + req_idx, 1)
-        else:
+            tl.store(reset_flags_out_ptr + batch_idx, should_reset.to(tl.int8))
+        elif should_reset:
             tl.store(num_accepted_tokens_out_ptr + req_idx, 1)
 
     # Skip no-op self-copy.
@@ -385,6 +399,30 @@ def postprocess_mamba_fused_kernel(
         CONV_STATE_DIM_FIRST,
         TEMPORAL_TILES,
     )
+
+
+@triton.jit
+def _apply_postprocess_reset_kernel(
+    reset_flags_ptr,  # int8[num_reqs], batch-indexed
+    idx_mapping_ptr,  # int32[num_reqs], batch -> req-slot (-1 = skip)
+    num_accepted_tokens_ptr,  # int32[max_reqs], req-slot-indexed (modified)
+    num_reqs,
+    BLOCK: tl.constexpr,
+):
+    """Scatter the reset flags produced by ``postprocess_mamba_fused_kernel``
+    (V2 align path) back into ``num_accepted_tokens`` in req-slot order.
+
+    Runs as a separate kernel launch after the postprocess kernel so the
+    read/write on ``num_accepted_tokens`` is ordered by CUDA's implicit
+    inter-launch fence rather than by fragile intra-launch CTA scheduling.
+    """
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < num_reqs
+    flags = tl.load(reset_flags_ptr + offs, mask=mask, other=0)
+    req_idx = tl.load(idx_mapping_ptr + offs, mask=mask, other=-1)
+    write = mask & (flags != 0) & (req_idx >= 0)
+    tl.store(num_accepted_tokens_ptr + req_idx, 1, mask=write)
 
 
 @triton.jit
@@ -627,6 +665,13 @@ class MambaSpecDecodeGPUContext:
     # Output buffer for num_accepted_tokens updates
     num_accepted_tokens_out: torch.Tensor
 
+    # V2 align path: batch-indexed reset flags produced by the fused postprocess
+    # kernel and consumed by a follow-up scatter that writes 1 back into the
+    # slot-indexed ``num_accepted_tokens_gpu``. Decoupling the reset from the
+    # main kernel removes an aliased read/write on ``num_accepted_tokens_ptr``
+    # across sibling CTAs (no cross-CTA ordering guarantee within a launch).
+    postprocess_reset_flags: torch.Tensor
+
     # Per-group block-table base addresses: int64[num_groups]. Populated in
     # initialize_from_forward_context from the persistent per-group block
     # table tensors (whose data_ptr is stable across steps).
@@ -696,6 +741,9 @@ class MambaSpecDecodeGPUContext:
             num_groups=len(mamba_group_ids),
             num_accepted_tokens_out=torch.zeros(
                 max_num_reqs, dtype=torch.int32, device=device
+            ),
+            postprocess_reset_flags=torch.zeros(
+                max_num_reqs, dtype=torch.int8, device=device
             ),
             block_table_ptrs=torch.zeros(
                 len(mamba_group_ids), dtype=torch.int64, device=device
@@ -903,6 +951,7 @@ class MambaSpecDecodeGPUContext:
             self.state_dim_row_count,
             self.state_dim_row_stride,
             self.num_accepted_tokens_out,
+            None,  # reset_flags_out: V1 uses num_accepted_tokens_out directly
             None,  # idx_mapping: V1 decision arrays are already in req order
             num_reqs,
             block_size=self.block_size,
@@ -965,10 +1014,17 @@ class MambaSpecDecodeGPUContext:
         """V2 align postprocess: save the running state to the block-aligned
         position after spec-decode acceptance leaves the sequence non-aligned.
 
-        ``num_accepted_tokens_gpu`` is updated in place (reset to 1 when the
-        accepted position stays in the running block); ``new_num_computed_tokens``
-        already holds the post-step computed count (PRECOMPUTED_NEW_COMPUTED).
-        ``idx_mapping`` maps batch row -> req-state slot (HAS_IDX_MAPPING).
+        The postprocess kernel writes a batch-indexed reset flag; a follow-up
+        scatter kernel then applies ``num_accepted_tokens_gpu[req_idx] = 1``
+        for each batch row whose flag is set. Splitting the reset off the main
+        kernel avoids an aliased read/write on ``num_accepted_tokens_gpu`` that
+        every CTA loads from at the top of the fused kernel, which has no
+        cross-CTA ordering guarantee within a single launch. Ordering between
+        the two launches is provided implicitly by CUDA.
+
+        ``new_num_computed_tokens`` already holds the post-step computed count
+        (PRECOMPUTED_NEW_COMPUTED). ``idx_mapping`` maps batch row -> req-state
+        slot (HAS_IDX_MAPPING).
         """
         if num_reqs == 0 or not self.is_initialized:
             return
@@ -990,7 +1046,8 @@ class MambaSpecDecodeGPUContext:
             self.state_group_indices,
             self.state_dim_row_count,
             self.state_dim_row_stride,
-            None,  # num_accepted_out: V2 updates num_accepted in place
+            None,  # num_accepted_out: V2 uses reset_flags + scatter instead
+            self.postprocess_reset_flags,
             idx_mapping,
             num_reqs,
             block_size=self.block_size,
@@ -999,6 +1056,18 @@ class MambaSpecDecodeGPUContext:
             HAS_IDX_MAPPING=True,
             PRECOMPUTED_NEW_COMPUTED=True,
             TEMPORAL_TILES=_TEMPORAL_TILES,
+        )
+        # Apply resets: scatter num_accepted_tokens_gpu[idx_mapping[b]] = 1
+        # for each batch row b whose flag was set by the postprocess kernel.
+        # Single-CTA launch with a constexpr BLOCK sized to max_num_reqs keeps
+        # the follow-up cheap and CUDA-graph friendly.
+        max_num_reqs = self.postprocess_reset_flags.shape[0]
+        _apply_postprocess_reset_kernel[(1,)](
+            self.postprocess_reset_flags,
+            idx_mapping,
+            num_accepted_tokens_gpu,
+            num_reqs,
+            BLOCK=triton.next_power_of_2(max_num_reqs),
         )
 
 
