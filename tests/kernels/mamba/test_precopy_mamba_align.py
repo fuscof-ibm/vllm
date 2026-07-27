@@ -113,10 +113,20 @@ def _reference(convs, ssms, bt, src_col, dst_col, bias, num_reqs):
     return conv_ref, ssm_ref
 
 
+# COPY_BLOCK_SIZE: 1024 matches the production launch; 8 shrinks the
+# per-tile rounding so the 4 KiB SSM block actually crosses tile
+# boundaries under TEMPORAL_TILES=_TEMPORAL_TILES. The partitioning math
+# is COPY_BLOCK_SIZE-agnostic, so a small value proves it for all values.
+_COPY_BLOCK_SIZES = [8, 1024]
+
+
 @_parametrize("num_reqs", [1, 4, 16])
 @_parametrize("token_bias", [0, 1, 2])
 @_parametrize("temporal_tiles", [1, _TEMPORAL_TILES])
-def test_precopy_matches_v1_copy_specs(num_reqs, token_bias, temporal_tiles):
+@_parametrize("copy_block_size", _COPY_BLOCK_SIZES)
+def test_precopy_matches_v1_copy_specs(
+    num_reqs, token_bias, temporal_tiles, copy_block_size
+):
     device = torch.device("cuda")
     torch.manual_seed(0)
     # Distinct physical block per (req, col) so copies never alias.
@@ -164,7 +174,7 @@ def test_precopy_matches_v1_copy_specs(num_reqs, token_bias, temporal_tiles):
         drs,
         idx_mapping,
         num_reqs,
-        COPY_BLOCK_SIZE=1024,
+        COPY_BLOCK_SIZE=copy_block_size,
         CONV_STATE_DIM_FIRST=False,
         TEMPORAL_TILES=temporal_tiles,
     )
@@ -179,5 +189,6 @@ if __name__ == "__main__":
     for nr in (1, 4, 16):
         for tb in (0, 1, 2):
             for tt in (1, _TEMPORAL_TILES):
-                test_precopy_matches_v1_copy_specs(nr, tb, tt)
+                for cbs in _COPY_BLOCK_SIZES:
+                    test_precopy_matches_v1_copy_specs(nr, tb, tt, cbs)
             print(f"OK num_reqs={nr} token_bias={tb}")
