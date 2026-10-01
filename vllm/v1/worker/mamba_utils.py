@@ -927,21 +927,34 @@ class MambaSpecDecodeGPUContext:
     ) -> None:
         """Extract and cache memory layout metadata from Mamba state tensors.
 
-        This method populates the pre-allocated metadata tensors with information
-        needed by `postprocess_mamba_fused_kernel` to perform state copies entirely
-        on the GPU without CPU-GPU synchronization.
+        This method populates the pre-allocated metadata tensors with the
+        information the fused copy kernels need to run entirely on the GPU without
+        CPU-GPU synchronization: `postprocess_mamba_fused_kernel` and
+        `precopy_mamba_align_fused_kernel`, which share the
+        `_copy_mamba_state_block` copy body. The block-table pointers captured here
+        are also read by `compute_aligned_state_indices`.
 
         For each Mamba layer and state type, the following metadata is extracted:
         - state_base_addrs: GPU memory address (data_ptr) of the state tensor
         - state_block_strides: Bytes between consecutive blocks (stride * elem_size)
         - state_elem_sizes: Element size in bytes (e.g., 2 for float16)
-        - state_inner_sizes: For conv states, elements per conv position (stride(1)),
-          used to compute offset when slicing state[block, offset:]. For temporal
-          states, this field is unused (set to 1).
+        - state_inner_sizes: elements per conv position (stride(1)) for SD conv
+          states, used for the byte offset when slicing state[block, offset:];
+          1 for DS conv states, whose rows are described by state_dim_row_count
+          and state_dim_row_stride; natural elements per block for temporal
+          states, which the kernel turns into the copy size (state_block_stride
+          can be a padded page stride, so it cannot serve that role).
         - state_conv_widths: Conv dimension size for conv states, 0 for temporal states
+        - state_group_indices: index into mamba_group_ids / block_table_ptrs (not
+          the kv_cache_group id), selecting which group's block table to read
+        - state_dim_row_count: DS conv only, dim rows per block (size(1)); stays 0
+          for SD conv and temporal states, which never read it
+        - state_dim_row_stride: DS conv only, bytes between dim rows
+          (stride(1) * elem_size); stays 0 otherwise
 
-        The conv vs temporal state type is detected by inspecting the copy function
-        name: functions containing "conv" are treated as conv states.
+        The conv vs temporal state type comes from the copy func identity
+        (get_conv_copy_spec vs get_temporal_copy_spec, asserted below); the kernel
+        itself keys off state_conv_widths (> 0 for conv).
 
         This method is idempotent - it only executes once (guarded by is_initialized
         flag) since the metadata is static after model loading.
