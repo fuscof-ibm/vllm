@@ -37,6 +37,19 @@ METRICS = [
     ("p99_itl_ms", "P99 ITL", "ms", False),
 ]
 
+# (title prefix, output subdir under OUT, baseline label, comparison label).
+# Labels must match CONFIGS.
+DELTA_PAIRS = [
+    # APC on vs off main
+    ("APC=on overhead", "apc_overhead", CONFIGS[0][0], CONFIGS[1][0]),
+
+    # APC on: main vs PR
+    ("APC=on speedup", "apc_speedup", CONFIGS[1][0], CONFIGS[2][0]),
+
+    # apc on vs on main vs pr
+    ("APC=on residual", "apc_residual", CONFIGS[0][0], CONFIGS[2][0]),
+]
+
 
 def load(dirpath: Path) -> dict[int, list[dict]]:
     runs: dict[int, list[dict]] = {}
@@ -195,39 +208,39 @@ def plot_tpot_relative() -> Path:
     return out
 
 
-def plot_throughput_delta_bars(display: str, slug: str) -> Path:
-    """Per-model grouped bar chart: c68c55d4 APC=off vs b730c4635
-    APC=on absolute output throughput per concurrency. Annotation on
-    the APC=on bar shows the residual gap to APC=off."""
+def plot_throughput_delta_bars(display: str, slug: str, title: str,
+                               subdir: str, base_label: str,
+                               cmp_label: str) -> Path:
+    """Grouped bar chart of absolute output throughput for two CONFIGS
+    entries, written to OUT/subdir/. Annotation on the comparison bar
+    shows its % gap to the baseline."""
     data = series(slug, "output_throughput")
-    needed = ["c68c55d4 APC=off", "b730c4635 APC=on"]
-    if any(label not in data for label in needed):
+    if base_label not in data or cmp_label not in data:
         return Path()
 
     color_map = {label: c for label, _, c, _ in CONFIGS}
-    off_concs, off_means, _ = data["c68c55d4 APC=off"]
-    off = dict(zip(off_concs, off_means))
-    pr_on_concs, pr_on_means, _ = data["b730c4635 APC=on"]
-    pr_on = dict(zip(pr_on_concs, pr_on_means))
-    concs = sorted(set(off) & set(pr_on))
+    base = dict(zip(*data[base_label][:2]))
+    comp = dict(zip(*data[cmp_label][:2]))
+    concs = sorted(set(base) & set(comp))
+    if not concs:
+        return Path()
+
+    base_vals = [base[c] for c in concs]
+    cmp_vals = [comp[c] for c in concs]
 
     fig, ax = plt.subplots(figsize=(9, 5.2))
     x = list(range(len(concs)))
     width = 0.38
 
-    off_vals = [off[c] for c in concs]
-    pr_vals = [pr_on[c] for c in concs]
-
-    ax.bar([xi - width / 2 for xi in x], off_vals, width,
-           label="c68c55d4 APC=off", color=color_map["c68c55d4 APC=off"],
+    ax.bar([xi - width / 2 for xi in x], base_vals, width,
+           label=base_label, color=color_map[base_label],
            edgecolor="black", linewidth=0.6)
-    pr_bars = ax.bar([xi + width / 2 for xi in x], pr_vals, width,
-                     label="b730c4635 APC=on",
-                     color=color_map["b730c4635 APC=on"],
-                     edgecolor="black", linewidth=0.6)
+    cmp_bars = ax.bar([xi + width / 2 for xi in x], cmp_vals, width,
+                      label=cmp_label, color=color_map[cmp_label],
+                      edgecolor="black", linewidth=0.6)
 
-    for bar, c in zip(pr_bars, concs):
-        d = (pr_on[c] - off[c]) / off[c] * 100.0
+    for bar, c in zip(cmp_bars, concs):
+        d = (comp[c] - base[c]) / base[c] * 100.0
         color = "darkred" if d < 0 else "darkgreen"
         ax.annotate(f"{d:+.1f}%",
                     xy=(bar.get_x() + bar.get_width() / 2,
@@ -240,17 +253,17 @@ def plot_throughput_delta_bars(display: str, slug: str) -> Path:
     ax.set_xticklabels([str(c) for c in concs])
     ax.set_xlabel("concurrency")
     ax.set_ylabel("output throughput (tokens/s)")
-    ax.set_title(f"APC residual overhead — {display}\n"
-                 "Output throughput: APC=off (c68c55d4) "
-                 "vs APC=on (b730c4635)",
+    ax.set_title(f"{title} — {display}\n"
+                 f"Output throughput: {base_label} vs {cmp_label}",
                  fontsize=12, fontweight="bold")
     ax.grid(True, axis="y", alpha=0.3)
     ax.legend(loc="upper left")
-    top = max(off_vals + pr_vals) * 1.18
-    ax.set_ylim(0, top)
+    ax.set_ylim(0, max(base_vals + cmp_vals) * 1.18)
 
     fig.tight_layout()
-    out = OUT / f"throughput_delta_{slug}.png"
+    outdir = OUT / subdir
+    outdir.mkdir(parents=True, exist_ok=True)
+    out = outdir / f"throughput_delta_{slug}.png"
     fig.savefig(out, dpi=140)
     plt.close(fig)
     return out
@@ -263,9 +276,12 @@ def main() -> None:
     saved.append(plot_throughput_relative())
     saved.append(plot_tpot_relative())
     for display, slug in MODELS:
-        saved.append(plot_throughput_delta_bars(display, slug))
+        for title, subdir, base_label, cmp_label in DELTA_PAIRS:
+            saved.append(plot_throughput_delta_bars(
+                display, slug, title, subdir, base_label, cmp_label))
     for p in saved:
-        print(p)
+        if p != Path():
+            print(p)
 
 
 if __name__ == "__main__":
