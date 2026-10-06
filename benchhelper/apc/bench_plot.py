@@ -25,9 +25,9 @@ MODELS = [
 
 # (config label, dir prefix, color, marker)
 CONFIGS = [
-    ("c68c55d4 APC=off", "main_apc_off", "tab:blue", "o"),
-    ("c68c55d4 APC=on", "main_apc_on", "tab:orange", "s"),
-    ("b730c4635 APC=on", "b730c4635_apc_on", "tab:green", "^"),
+    ("main(c68c55d4) APC=off", "main_apc_off", "tab:blue", "o"),
+    ("main (c68c55d4) APC=on", "main_apc_on", "tab:orange", "s"),
+    ("fused kernel (b730c4635) APC=on", "b730c4635_apc_on", "tab:green", "^"),
 ]
 
 # (json key, panel title, y-label, higher_is_better)
