@@ -4,6 +4,7 @@
 """Plot APC sweep results: per-model 4-panel dashboards plus a relative
 throughput summary across models."""
 
+import argparse
 import json
 import statistics
 from pathlib import Path
@@ -96,7 +97,7 @@ def series(model_slug: str, key: str
     return out
 
 
-def plot_model_dashboard(display: str, slug: str) -> Path:
+def plot_model_dashboard(display: str, slug: str, ext: str) -> Path:
     fig, axes = plt.subplots(2, 2, figsize=(11, 8))
     fig.suptitle(
         f"APC sweep — {display}", fontsize=14, fontweight="bold")
@@ -125,13 +126,13 @@ def plot_model_dashboard(display: str, slug: str) -> Path:
         ax.legend(fontsize=8)
 
     fig.tight_layout(rect=(0, 0, 1, 0.96))
-    out = OUT / f"dashboard_{slug}.png"
+    out = OUT / f"dashboard_{slug}.{ext}"
     fig.savefig(out, dpi=140)
     plt.close(fig)
     return out
 
 
-def plot_throughput_relative() -> Path:
+def plot_throughput_relative(ext: str) -> Path:
     """For each model, plot throughput of APC-on configs as % of APC=off."""
     fig, axes = plt.subplots(1, 3, figsize=(14, 4.5), sharey=True)
     fig.suptitle(
@@ -164,13 +165,13 @@ def plot_throughput_relative() -> Path:
 
     axes[0].set_ylabel("throughput (% of APC=off)")
     fig.tight_layout(rect=(0, 0, 1, 0.93))
-    out = OUT / "throughput_relative.png"
+    out = OUT / f"throughput_relative.{ext}"
     fig.savefig(out, dpi=140)
     plt.close(fig)
     return out
 
 
-def plot_tpot_relative() -> Path:
+def plot_tpot_relative(ext: str) -> Path:
     fig, axes = plt.subplots(1, 3, figsize=(14, 4.5), sharey=True)
     fig.suptitle(
         "Mean TPOT relative to APC=off (lower is better)",
@@ -202,7 +203,7 @@ def plot_tpot_relative() -> Path:
 
     axes[0].set_ylabel("mean TPOT (% of APC=off)")
     fig.tight_layout(rect=(0, 0, 1, 0.93))
-    out = OUT / "tpot_relative.png"
+    out = OUT / f"tpot_relative.{ext}"
     fig.savefig(out, dpi=140)
     plt.close(fig)
     return out
@@ -210,7 +211,7 @@ def plot_tpot_relative() -> Path:
 
 def plot_throughput_delta_bars(display: str, slug: str, title: str,
                                subdir: str, base_label: str,
-                               cmp_label: str) -> Path:
+                               cmp_label: str, ext: str) -> Path:
     """Grouped bar chart of absolute output throughput for two CONFIGS
     entries, written to OUT/subdir/. Annotation on the comparison bar
     shows its % gap to the baseline."""
@@ -263,26 +264,41 @@ def plot_throughput_delta_bars(display: str, slug: str, title: str,
     fig.tight_layout()
     outdir = OUT / subdir
     outdir.mkdir(parents=True, exist_ok=True)
-    out = outdir / f"throughput_delta_{slug}.png"
+    out = outdir / f"throughput_delta_{slug}.{ext}"
     fig.savefig(out, dpi=140)
     plt.close(fig)
     return out
 
 
-def main() -> None:
+def main(ext: str) -> None:
     saved = []
     for display, slug in MODELS:
-        saved.append(plot_model_dashboard(display, slug))
-    saved.append(plot_throughput_relative())
-    saved.append(plot_tpot_relative())
+        saved.append(plot_model_dashboard(display, slug, ext))
+    saved.append(plot_throughput_relative(ext))
+    saved.append(plot_tpot_relative(ext))
     for display, slug in MODELS:
         for title, subdir, base_label, cmp_label in DELTA_PAIRS:
             saved.append(plot_throughput_delta_bars(
-                display, slug, title, subdir, base_label, cmp_label))
+                display, slug, title, subdir, base_label, cmp_label, ext))
     for p in saved:
         if p != Path():
             print(p)
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=f"Reads {ROOT}/<config>_<model>/c*_run*.json and writes "
+               f"figures under {OUT}/.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    ap.add_argument(
+        "-f", "--format", default="png", choices=["png", "svg", "pdf"],
+        help="image format for every figure (default: %(default)s). "
+             "svg/pdf are vector; use pdf for LaTeX \\includegraphics",
+    )
+    args = ap.parse_args()
+    if args.format == "svg":
+        # Keep text as text so labels stay selectable/editable downstream.
+        plt.rcParams["svg.fonttype"] = "none"
+    main(args.format)
