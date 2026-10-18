@@ -14,8 +14,12 @@ from ...utils import large_gpu_mark, multi_gpu_test
 MAMBA2_MODEL = "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16"
 # FlashInfer 0.7.0's standard SSU cannot compile Nano's DIM=80 configuration.
 MAMBA2_FLASHINFER_MODEL = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4"
+# Granite-4 is the only ReplaySSM model with mamba_n_groups=1, so TP>1 shards
+# heads while B_cache stays at a single padded group.
+GRANITE4_MODEL = "ibm-granite/granite-4.0-h-tiny"
 MODELS = [
     pytest.param(MAMBA2_MODEL, marks=large_gpu_mark(min_gb=40)),
+    pytest.param(GRANITE4_MODEL, marks=large_gpu_mark(min_gb=40)),
 ]
 FLASHINFER_MODELS = [
     pytest.param(MAMBA2_FLASHINFER_MODEL, marks=large_gpu_mark(min_gb=40)),
@@ -91,7 +95,7 @@ def test_replayssm_decode_matches_baseline(vllm_runner, model_name):
 
 
 @multi_gpu_test(num_gpus=2)
-@pytest.mark.parametrize("model_name", [MAMBA2_MODEL])
+@pytest.mark.parametrize("model_name", [MAMBA2_MODEL, GRANITE4_MODEL])
 def test_replayssm_decode_matches_baseline_tp2(vllm_runner, model_name):
     # Tensor-parallel correctness: ReplaySSM's caches and checkpoint state are
     # sharded per rank, so TP2 decode must still match the baseline at TP2.
@@ -285,7 +289,7 @@ def test_replayssm_prefix_caching_matches_baseline(vllm_runner, model_name):
 
 
 @multi_gpu_test(num_gpus=2)
-@pytest.mark.parametrize("model_name", [MAMBA2_MODEL])
+@pytest.mark.parametrize("model_name", [MAMBA2_MODEL, GRANITE4_MODEL])
 def test_replayssm_prefix_caching_matches_baseline_tp2(vllm_runner, model_name):
     _check_replayssm_prefix_caching_parity(
         vllm_runner, model_name, tensor_parallel_size=2
