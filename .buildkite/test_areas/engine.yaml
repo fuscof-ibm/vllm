@@ -172,6 +172,7 @@ steps:
     - vllm/config/cache.py
     - vllm/config/vllm.py
     - vllm/model_executor/layers/mamba/
+    - vllm/model_executor/models/granitemoehybrid.py
     - vllm/model_executor/models/nemotron_h.py
     - vllm/model_executor/warmup/replayssm_warmup.py
     - vllm/v1/attention/backends/mamba_attn.py
