@@ -490,8 +490,18 @@ class FlashInferAllReduce:
             return False
 
         num_tokens, hidden_dim = input_tensor.shape
+        element_size = input_tensor.element_size()
+
+        # The fusion kernels load each token row as float4, so a row must be a
+        # whole number of 16-byte vectors. MNNVL asserts this (token_dim %
+        # (sizeof(float4)/sizeof(T))) and kills the worker; the trtllm path has
+        # no such check and silently truncates its indexing. Mamba2 with
+        # n_groups=1 all-reduces an fp32 (num_tokens, 1) partial sum, which
+        # hits both.
+        if hidden_dim * element_size % 16 != 0:
+            return False
+
         if not self.max_num_tokens:
-            element_size = torch.tensor([], dtype=input_tensor.dtype).element_size()
             self.max_num_tokens = self.max_workspace_size // (hidden_dim * element_size)
 
         if num_tokens > self.max_num_tokens:
