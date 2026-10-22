@@ -12,7 +12,10 @@ CUDA-graph capture on the pre-release Blackwell FP4 path); pass
 --no-disable-flashinfer-autotune for non-FP4 models.
 
 Examples:
-    python e2e_decode_speedup.py --model-id nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16
+    python e2e_decode_speedup.py --model-id ibm-granite/granite-4.0-h-tiny
+    VLLM_USE_V2_MODEL_RUNNER=0 python e2e_decode_speedup.py \
+        --mamba-backend triton \
+        --model-id nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16   # triton needs MRv1
     python e2e_decode_speedup.py --dtype auto --buffer-len 16 \
         --model-id nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4   # B300 NVFP4
 
@@ -42,6 +45,14 @@ def parse_args():
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument(
         "--buffer-len", type=int, default=16, help="ReplaySSM input-buffer length."
+    )
+    p.add_argument(
+        "--mamba-backend",
+        default="flashinfer",
+        choices=["triton", "flashinfer"],
+        help="Mamba SSU backend for both modes (default: flashinfer). "
+        "'triton' is Model Runner V1-only, so it needs "
+        "VLLM_USE_V2_MODEL_RUNNER=0.",
     )
     p.add_argument(
         "--dtype",
@@ -116,6 +127,8 @@ def run_worker(args):
         gpu_memory_utilization=args.gpu_memory_utilization,
         # SSM state dtype (applies to both standard and ReplaySSM).
         mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
+        # Both modes share the backend so only ReplaySSM differs between runs.
+        mamba_backend=args.mamba_backend,
     )
     if args.disable_flashinfer_autotune:
         # FP4-MoE autotuner is unstable under CUDA-graph capture on Blackwell;
@@ -202,6 +215,8 @@ def run_one_mode(args, mode) -> dict:
         str(args.repeats),
         "--buffer-len",
         str(args.buffer_len),
+        "--mamba-backend",
+        args.mamba_backend,
         "--dtype",
         args.dtype,
         "--gpu-memory-utilization",
@@ -244,7 +259,8 @@ def main():
 
     print(
         f"model={args.model_id}  batch_size={args.batch_size}  "
-        f"steps={args.num_steps}  buffer_len={args.buffer_len}  dtype={args.dtype}"
+        f"steps={args.num_steps}  buffer_len={args.buffer_len}  dtype={args.dtype}  "
+        f"mamba_backend={args.mamba_backend}"
     )
 
     std = run_one_mode(args, "standard")
