@@ -456,6 +456,125 @@ def test_deep_sleep_fp8_kvcache(gpu_memory_cleared):
     assert output[0].outputs[0].text == output2[0].outputs[0].text
 
 
+def _mamba_align_captured_ptrs(worker) -> dict[str, object] | None:
+    """Every address the align context captured at KV-cache init, or None if it
+    was never built. One ``is_initialized`` guard covers the state tensors and
+    both block tables.
+    """
+    ctx = getattr(worker.model_runner.model_state, "_mamba_ctx", None)
+    if ctx is None or not ctx.is_initialized:
+        return None
+    return {
+        "state_base_addrs": ctx.state_base_addrs.tolist(),
+        "block_table_ptrs": ctx.block_table_ptrs.tolist(),
+        "aligned_index_block_table_ptrs": (ctx.aligned_index_block_table_ptrs.tolist()),
+        "block_table_stride_req": ctx.block_table_stride_req,
+    }
+
+
+def _mamba_align_live_ptrs(worker) -> dict[str, object]:
+    """The same addresses re-read from the live tensors, walking
+    ``ctx.mamba_group_ids`` so the order matches ``_populate_metadata``.
+    """
+    from vllm.v1.worker.mamba_utils import (
+        _get_mamba_spec_for_layer,
+        _reinterpret_u64_as_i64,
+    )
+
+    runner = worker.model_runner
+    ctx = runner.model_state._mamba_ctx
+    kv_cache_config = runner.kv_cache_config
+    forward_context = runner.vllm_config.compilation_config.static_forward_context
+    copy_funcs = runner.model_state._mamba_state_copy_funcs
+    block_tables = runner.block_tables
+
+    state_addrs = []
+    for group_id in ctx.mamba_group_ids:
+        group = kv_cache_config.kv_cache_groups[group_id]
+        for layer_name in group.layer_names:
+            spec = _get_mamba_spec_for_layer(group, layer_name)
+            kv_caches = forward_context[layer_name].kv_cache
+            for state_type_idx in range(len(copy_funcs[spec.mamba_type])):
+                state_addrs.append(
+                    _reinterpret_u64_as_i64(kv_caches[state_type_idx].data_ptr())
+                )
+
+    return {
+        "state_base_addrs": state_addrs,
+        "block_table_ptrs": [
+            _reinterpret_u64_as_i64(block_tables.block_tables[gid].gpu.data_ptr())
+            for gid in ctx.mamba_group_ids
+        ],
+        "aligned_index_block_table_ptrs": [
+            _reinterpret_u64_as_i64(block_tables.input_block_tables[gid].data_ptr())
+            for gid in ctx.mamba_group_ids
+        ],
+        # _populate_metadata asserts every mamba block table shares stride(0),
+        # so any group's stride is the one it captured.
+        "block_table_stride_req": block_tables.block_tables[
+            ctx.mamba_group_ids[0]
+        ].gpu.stride(0),
+    }
+
+
+@create_new_process_for_each_test()
+@pytest.mark.skipif(
+    not current_platform.is_cuda_alike(), reason="cuMem sleep-mode allocator"
+)
+def test_sleep_mamba_align_state_pointers(monkeypatch: pytest.MonkeyPatch):
+    """``MambaSpecDecodeGPUContext`` captures raw mamba-state and block-table
+    addresses once, at KV-cache init, guarded by ``is_initialized``, and hands
+    those integers to Triton kernels
+    """
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "1")
+    monkeypatch.setenv("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+    envs.disable_envs_cache()
+
+    llm = LLM(
+        "ai21labs/Jamba-tiny-dev",
+        enable_sleep_mode=True,
+        enable_prefix_caching=True,
+        max_model_len=1024,
+        max_num_seqs=4,
+        gpu_memory_utilization=0.4,
+    )
+
+    assert llm.llm_engine.vllm_config.cache_config.mamba_cache_mode == "align", (
+        "align mode was not selected; nothing would capture pointers"
+    )
+
+    captured_before = llm.collective_rpc(_mamba_align_captured_ptrs)
+    if any(p is None for p in captured_before):
+        pytest.fail("align context was not initialized; nothing to check")
+    # Agreement before sleep rules out the two walks simply disagreeing on
+    # ordering, which would otherwise look like a post-wake-up mismatch.
+    assert llm.collective_rpc(_mamba_align_live_ptrs) == captured_before
+
+    prompt = "How are you?"
+    sampling_params = SamplingParams(temperature=0, max_tokens=10, logprobs=0)
+    expected = llm.generate(prompt, sampling_params)[0].outputs[0]
+
+    llm.sleep(level=1)
+
+    llm.wake_up()
+
+    # Messages are spelled out because the body runs in a subprocess, without
+    # pytest assertion rewriting.
+    captured = llm.collective_rpc(_mamba_align_captured_ptrs)
+    assert captured == captured_before, f"{captured} != {captured_before}"
+    live = llm.collective_rpc(_mamba_align_live_ptrs)
+    assert live == captured_before, f"{live} != {captured_before}"
+
+    actual = llm.generate(prompt, sampling_params)[0].outputs[0]
+    assert actual.token_ids == expected.token_ids
+    logprobs = [
+        [lp[t].logprob for lp, t in zip(o.logprobs, o.token_ids)]
+        for o in (expected, actual)
+    ]
+    assert logprobs[0] == logprobs[1]
+
+
 @requires_fp8
 def test_deep_sleep_fp8_kvcache_with_undefined_remap(
     monkeypatch: pytest.MonkeyPatch,
