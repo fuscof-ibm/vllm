@@ -371,7 +371,7 @@ def bench_one(
 
     for _ in range(iters_warmup):
         launch()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
 
     layout = "DS" if conv_state_dim_first else "SD"
     # Underscore separator: '/' is Nsight's NVTX level marker and breaks
@@ -384,7 +384,7 @@ def bench_one(
     for _ in range(iters_timed):
         launch()
     end.record()
-    torch.cuda.synchronize()
+    torch.accelerator.synchronize()
     nvtx.range_pop()
 
     avg_us = start.elapsed_time(end) * 1000.0 / iters_timed
