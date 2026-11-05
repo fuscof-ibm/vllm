@@ -21,7 +21,8 @@ postprocess decision logic. State layouts for supported models (all tp=1):
   - temporal: (mamba_num_heads=128, mamba_head_dim=64, ssm_state_size=128)
     fp32 (4 MiB/block; mamba_ssm_cache_dtype="float32").
 
-Grid mirrors the fused-kernel launch shape (num_reqs, total_states).
+Grid mirrors the fused-kernel launch shape
+(num_reqs, total_states, temporal_tiles).
 
 Usage:
     # nsys (whole-run trace)
@@ -35,7 +36,7 @@ Usage:
     # ncu (kernel metrics; use --nvtx-include to slice per-config).
     # The trailing "/" is Nsight's push/pop match marker, not part of the name;
     # the range names below intentionally contain no "/" so they parse.
-    ncu --set full --nvtx --nvtx-include "reqs=64_conv=SD/" \
+    ncu --set full --nvtx --nvtx-include "reqs=64_conv=SD_tiles=16/" \
       -o bench_copy_mamba .venv/bin/python bench_copy_mamba_state_block.py
 
     # Wall-clock only:
@@ -50,7 +51,7 @@ import torch
 import torch.cuda.nvtx as nvtx
 
 from vllm.triton_utils import tl, triton
-from vllm.v1.worker.mamba_utils import _copy_mamba_state_block
+from vllm.v1.worker.mamba_utils import _TEMPORAL_TILES, _copy_mamba_state_block
 
 DEVICE = "cuda"
 
@@ -180,7 +181,7 @@ def bench_copy_mamba_state_block(
 ):
     """Minimal wrapper: run the copy body for every (batch, state) program.
 
-    Grid: (num_reqs, total_states).
+    Grid: (num_reqs, total_states, TEMPORAL_TILES).
     """
     batch_idx = tl.program_id(0)
     state_idx = tl.program_id(1)
@@ -309,6 +310,7 @@ def bench_one(
     model: ModelStateConfig,
     num_reqs: int,
     conv_state_dim_first: bool,
+    temporal_tiles: int,
     iters_warmup: int,
     iters_timed: int,
 ) -> float:
@@ -340,8 +342,6 @@ def bench_one(
         [block_table.data_ptr()], dtype=torch.int64, device=DEVICE
     )
     block_table_stride_req = block_table.stride(0)
-
-    temporal_tiles = 8
 
     grid = (num_reqs, model.total_states, temporal_tiles)
     args = (
@@ -376,7 +376,7 @@ def bench_one(
     layout = "DS" if conv_state_dim_first else "SD"
     # Underscore separator: '/' is Nsight's NVTX level marker and breaks
     # --nvtx-include filters when it appears inside a range name.
-    label = f"reqs={num_reqs}_conv={layout}"
+    label = f"reqs={num_reqs}_conv={layout}_tiles={temporal_tiles}"
     nvtx.range_push(label)
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
@@ -395,7 +395,7 @@ def bench_one(
     # Read + write: memory traffic is 2x copy size.
     gbps = (2 * total_bytes) / (avg_us * 1e-6) / 1e9
     print(
-        f"{label:24s} grid={grid!s:16s} "
+        f"{label:30s} grid={grid!s:16s} "
         f"copy/req={bytes_per_req / 1024 / 1024:6.2f} MiB  "
         f"avg={avg_us:8.2f} us  BW~{gbps:6.1f} GB/s"
     )
@@ -427,6 +427,13 @@ def main():
         choices=["SD", "DS", "both"],
         default="SD",
         help="Conv state layout to benchmark. Real Qwen3.5-9B is SD.",
+    )
+    parser.add_argument(
+        "--temporal-tiles",
+        type=int,
+        nargs="+",
+        default=[_TEMPORAL_TILES],
+        help="TEMPORAL_TILES values to sweep (default: production value).",
     )
     parser.add_argument(
         "--iters-warmup",
@@ -483,8 +490,11 @@ def main():
     torch.cuda.cudart().cudaProfilerStart()
     t0 = time.perf_counter()
     for conv_ds in layouts:
-        for nr in args.concurrencies:
-            bench_one(model, nr, conv_ds, args.iters_warmup, args.iters_timed)
+        for tiles in args.temporal_tiles:
+            for nr in args.concurrencies:
+                bench_one(
+                    model, nr, conv_ds, tiles, args.iters_warmup, args.iters_timed
+                )
     torch.cuda.cudart().cudaProfilerStop()
     print(f"\ntotal wall: {time.perf_counter() - t0:.2f}s")
 
