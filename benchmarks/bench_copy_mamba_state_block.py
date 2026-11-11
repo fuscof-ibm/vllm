@@ -30,7 +30,7 @@ Usage:
     # nsys (whole-run trace)
     nsys profile -t cuda,nvtx --capture-range=cudaProfilerApi \
       --force-overwrite=true -o bench_copy_mamba \
-      .venv/bin/python bench_copy_mamba_state_block.py
+      python bench_copy_mamba_state_block.py
 
     nsys stats --report cuda_gpu_kern_sum bench_copy_mamba.nsys-rep \
       | grep -i bench_copy_mamba_state_block
@@ -39,7 +39,7 @@ Usage:
     # The trailing "/" is Nsight's push/pop match marker, not part of the name;
     # the range names below intentionally contain no "/" so they parse.
     ncu --set full --nvtx --nvtx-include "reqs=64_conv=SD_tiles=16/" \
-      -o bench_copy_mamba .venv/bin/python bench_copy_mamba_state_block.py
+      -o bench_copy_mamba python bench_copy_mamba_state_block.py
 
     # Wall-clock only:
     python bench_copy_mamba_state_block.py
