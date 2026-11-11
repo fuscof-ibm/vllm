@@ -3,7 +3,9 @@
 """Microbenchmark for the `_copy_mamba_state_block` device function.
 
 Isolates the per-(request, state, tile) mamba state copy body from the surrounding
-postprocess decision logic. State layouts for supported models (all tp=1):
+postprocess decision logic. `--model` takes any HF hybrid model with a conv +
+temporal state per layer; its layout (tp=1) comes from vLLM's own state
+shape/dtype logic. These presets work offline:
 
 - Qwen/Qwen3.5-9B (gated delta net, num_spec=2): 24 linear layers x 2 state
   types = 48 states,
@@ -40,16 +42,29 @@ Usage:
       -o bench_copy_mamba .venv/bin/python bench_copy_mamba_state_block.py
 
     # Wall-clock only:
-    .venv/bin/python bench_copy_mamba_state_block.py
+    python bench_copy_mamba_state_block.py
+
+    # Any HF hybrid model (fetches its config):
+    python bench_copy_mamba_state_block.py \
+      --model ibm-granite/granite-4.0-h-tiny
 """
 
 import argparse
+import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.cuda.nvtx as nvtx
 
+from vllm.engine.arg_utils import EngineArgs
+from vllm.model_executor.layers.mamba.mamba_utils import (
+    get_conv_copy_spec,
+    get_temporal_copy_spec,
+    is_conv_state_dim_first,
+)
+from vllm.model_executor.models import ModelRegistry
+from vllm.transformers_utils.config import get_config, get_hf_text_config
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.mamba_utils import _TEMPORAL_TILES, _copy_mamba_state_block
 
@@ -68,11 +83,11 @@ class ModelStateConfig:
     num_state_layers: int
     conv_dim: int
     conv_state_len: int
-    temporal_shape: tuple[int, int, int]
+    temporal_shape: tuple[int, ...]
     conv_dtype: torch.dtype
     temporal_dtype: torch.dtype
     num_spec: int
-    layer_kind: str  # "gated_delta_net", "mamba2", ...
+    layer_kind: str  # "gated_delta_net", "mamba2", or the HF architecture
     notes: str = ""
 
     @property
@@ -146,6 +161,75 @@ MODEL_CONFIGS: dict[str, ModelStateConfig] = {
     _QWEN3_5_0_8B.name: _QWEN3_5_0_8B,
     _NEMOTRON3_SUPER_120B.name: _NEMOTRON3_SUPER_120B,
 }
+
+
+def model_state_config_from_hf(
+    model: str, num_spec: int | None, trust_remote_code: bool
+) -> ModelStateConfig:
+    """Derive the state layout of `model` from vLLM's own shape/dtype logic.
+
+    `num_spec=None` uses the model's MTP layer count from its HF config.
+    """
+    if num_spec is None:
+        hf_text_config = get_hf_text_config(get_config(model, trust_remote_code))
+        num_spec = (
+            getattr(hf_text_config, "mtp_num_hidden_layers", None)
+            or getattr(hf_text_config, "num_nextn_predict_layers", None)
+            or 0
+        )
+    # ngram loads no draft model; only num_speculative_tokens affects shapes.
+    speculative_config = (
+        {"method": "ngram", "num_speculative_tokens": num_spec} if num_spec else None
+    )
+    vllm_config = EngineArgs(
+        model=model,
+        trust_remote_code=trust_remote_code,
+        skip_tokenizer_init=True,
+        speculative_config=speculative_config,
+    ).create_engine_config()
+    model_config = vllm_config.model_config
+    model_cls, _ = ModelRegistry.resolve_model_cls(
+        model_config.architecture, model_config=model_config
+    )
+    if not hasattr(model_cls, "get_mamba_state_copy_func") or (
+        model_cls.get_mamba_state_copy_func()
+        != (get_conv_copy_spec, get_temporal_copy_spec)
+    ):
+        raise ValueError(
+            f"{model} ({model_config.architecture}) has no conv + temporal "
+            "mamba state layout"
+        )
+
+    conv_shape, temporal_shape = model_cls.get_mamba_state_shape_from_config(
+        vllm_config
+    )
+    conv_dtype, temporal_dtype = model_cls.get_mamba_state_dtype_from_config(
+        vllm_config
+    )
+    if is_conv_state_dim_first():
+        conv_dim, conv_state_len = conv_shape
+    else:
+        conv_state_len, conv_dim = conv_shape
+
+    # GDN hybrids tag their state layers "linear_attention", mamba ones "mamba".
+    parallel_config = vllm_config.parallel_config
+    num_state_layers = model_config.get_num_layers_by_block_type(
+        parallel_config, "mamba"
+    ) or model_config.get_num_layers_by_block_type(parallel_config, "linear_attention")
+    total_layers = model_config.get_total_num_hidden_layers()
+    return ModelStateConfig(
+        name=model,
+        num_state_layers=num_state_layers,
+        conv_dim=conv_dim,
+        conv_state_len=conv_state_len,
+        temporal_shape=tuple(temporal_shape),
+        conv_dtype=conv_dtype,
+        temporal_dtype=temporal_dtype,
+        num_spec=num_spec,
+        layer_kind=model_config.architecture,
+        notes=f"{num_state_layers} state layers out of {total_layers}",
+    )
+
 
 # Each request gets its own src/dst block ids inside every state tensor so
 # concurrent copies don't collide and L2 doesn't mask DRAM bandwidth; the
@@ -406,14 +490,30 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--model",
-        choices=sorted(MODEL_CONFIGS.keys()),
         default=_QWEN3_5_9B.name,
-        help="Model whose state layout drives the benchmark.",
+        help=(
+            "HF model whose state layout drives the benchmark. Preset names "
+            "(see --list-models) work offline; others fetch the HF config."
+        ),
     )
     parser.add_argument(
         "--list-models",
         action="store_true",
-        help="List available model names for --model and exit.",
+        help="List offline preset names for --model and exit.",
+    )
+    parser.add_argument(
+        "--num-spec",
+        type=int,
+        default=None,
+        help=(
+            "Speculative tokens, which lengthen the conv state. Default: the "
+            "preset's value, or the MTP layer count in the HF config."
+        ),
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Trust remote code when loading the HF config.",
     )
     parser.add_argument(
         "--concurrencies",
@@ -457,12 +557,21 @@ def main():
             print(name)
         return
 
-    model = MODEL_CONFIGS[args.model]
+    model = MODEL_CONFIGS.get(args.model)
+    if model is None:
+        model = model_state_config_from_hf(
+            args.model, args.num_spec, args.trust_remote_code
+        )
+    elif args.num_spec is not None:
+        model = replace(
+            model,
+            num_spec=args.num_spec,
+            conv_state_len=model.conv_state_len - model.num_spec + args.num_spec,
+        )
     conv_elem = torch.tensor([], dtype=model.conv_dtype).element_size()
     temp_elem = torch.tensor([], dtype=model.temporal_dtype).element_size()
     conv_bytes_per_block = model.conv_dim * model.conv_state_len * conv_elem
-    th, td1, td2 = model.temporal_shape
-    temp_inner = th * td1 * td2
+    temp_inner = math.prod(model.temporal_shape)
     temp_bytes_per_block = temp_inner * temp_elem
 
     assert torch.cuda.is_available(), "CUDA required"
