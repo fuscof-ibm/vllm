@@ -191,13 +191,16 @@ def model_state_config_from_hf(
     model_cls, _ = ModelRegistry.resolve_model_cls(
         model_config.architecture, model_config=model_config
     )
-    if not hasattr(model_cls, "get_mamba_state_copy_func") or (
-        model_cls.get_mamba_state_copy_func()
+    if (
+        not hasattr(model_cls, "get_mamba_state_copy_func")
+        # Models with several state layouts (e.g. Qwen4Exp) aren't modeled here.
+        or hasattr(model_cls, "get_mamba_specs_from_config")
+        or model_cls.get_mamba_state_copy_func()
         != (get_conv_copy_spec, get_temporal_copy_spec)
     ):
         raise ValueError(
-            f"{model} ({model_config.architecture}) has no conv + temporal "
-            "mamba state layout"
+            f"{model} ({model_config.architecture}) has no single conv + "
+            "temporal mamba state layout"
         )
 
     conv_shape, temporal_shape = model_cls.get_mamba_state_shape_from_config(
@@ -211,11 +214,14 @@ def model_state_config_from_hf(
     else:
         conv_state_len, conv_dim = conv_shape
 
-    # GDN hybrids tag their state layers "linear_attention", mamba ones "mamba".
+    # Older configs tag mamba layers "mamba"; Transformers 5 remaps them to
+    # "linear_attention", the tag GDN layers already use.
     parallel_config = vllm_config.parallel_config
     num_state_layers = model_config.get_num_layers_by_block_type(
         parallel_config, "mamba"
     ) or model_config.get_num_layers_by_block_type(parallel_config, "linear_attention")
+    if num_state_layers == 0:
+        raise ValueError(f"{model}: found no mamba or linear_attention layers")
     total_layers = model_config.get_total_num_hidden_layers()
     return ModelStateConfig(
         name=model,
@@ -557,6 +563,7 @@ def main():
             print(name)
         return
 
+    assert torch.cuda.is_available(), "CUDA required"
     model = MODEL_CONFIGS.get(args.model)
     if model is None:
         model = model_state_config_from_hf(
@@ -574,7 +581,6 @@ def main():
     temp_inner = math.prod(model.temporal_shape)
     temp_bytes_per_block = temp_inner * temp_elem
 
-    assert torch.cuda.is_available(), "CUDA required"
     print(f"device: {torch.cuda.get_device_name(0)}")
     print(
         f"model: {model.name} ({model.layer_kind}) tp=1 num_spec={model.num_spec}\n"
