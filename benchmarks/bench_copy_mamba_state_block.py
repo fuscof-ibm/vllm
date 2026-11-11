@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Microbenchmark for the `_copy_mamba_state_block` device function.
 
-Isolates the per-(request, state) mamba state copy body from the surrounding
+Isolates the per-(request, state, tile) mamba state copy body from the surrounding
 postprocess decision logic. State layouts for supported models (all tp=1):
 
 - Qwen/Qwen3.5-9B (gated delta net, num_spec=2): 24 linear layers x 2 state
@@ -179,7 +179,7 @@ def bench_copy_mamba_state_block(
     CONV_STATE_DIM_FIRST: tl.constexpr,
     TEMPORAL_TILES: tl.constexpr,
 ):
-    """Minimal wrapper: run the copy body for every (batch, state) program.
+    """Minimal wrapper: run the copy body for every (batch, state, tile) program.
 
     Grid: (num_reqs, total_states, TEMPORAL_TILES).
     """
@@ -289,8 +289,8 @@ def build_metadata(state_tensors, is_conv_list, conv_state_dim_first: bool):
 
 
 def bytes_moved_per_launch(state_tensors, is_conv_list, conv_state_dim_first: bool):
-    """Bytes copied (read+write) across all (num_reqs, state) programs, per
-    request. Multiply by num_reqs to get per-launch total."""
+    """Bytes copied (read+write) across all (num_reqs, state, tile) programs,
+    per request. Multiply by num_reqs to get per-launch total."""
     per_req = 0
     for t, is_conv in zip(state_tensors, is_conv_list):
         elem = t.element_size()
