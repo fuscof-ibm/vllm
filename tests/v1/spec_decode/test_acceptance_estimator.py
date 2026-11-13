@@ -250,6 +250,30 @@ def test_refit_survives_a_position_with_no_observations():
     )
 
 
+def test_refit_rejects_a_non_finite_slope_step():
+    """A slope denominator that cancels to zero must not reach the coefficients.
+
+    The arrowhead's Schur complement is a difference of large fp32 sums, so
+    rounding can drive it to zero, and the slope step to +inf. Writing -L2 into
+    one position's info entry zeroes it exactly here.
+    """
+    device = current_platform.device_type
+    estimator = OnlineAcceptanceEstimator(MAX_NUM_REQS, NUM_STEPS, device)
+    estimator.info[0, 0] = -estimator.L2
+    estimator.info[:, 2] = 1.0
+    estimator.grad[:, 0] = 1.0
+    estimator.grad[:, 1] = 0.5
+    estimator.counts[:] = 20.0
+    before_slope = estimator.slope.clone()
+    before_intercepts = estimator.intercepts.clone()
+
+    estimator._refit()
+
+    torch.testing.assert_close(estimator.slope, before_slope, rtol=0, atol=0)
+    assert estimator.intercepts.isfinite().all()
+    assert not torch.equal(estimator.intercepts, before_intercepts)
+
+
 def test_step_damping_scales_with_the_evidence():
     """A round moves a coefficient in proportion to the samples behind it.
 
