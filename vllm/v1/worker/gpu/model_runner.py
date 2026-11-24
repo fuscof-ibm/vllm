@@ -174,6 +174,7 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+from vllm.v1.worker.gpu.spec_decode.av_trace import AVTracer
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
@@ -629,6 +630,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         with use_workspace_lane(self._draft_workspace_lane), single_pp_stage():
             yield
 
+    def _av_trace(self) -> AVTracer | None:
+        # Through the manager: warmups clear it, so their steps go untraced.
+        av = self.adaptive_verification
+        return None if av is None else av.trace
+
     def on_target_weights_replaced(self) -> None:
         # Called whenever the target's weights are replaced (reload, weight
         # transfer), so draft weights derived from them must follow.
@@ -768,6 +774,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             additional_attn_cg_support=additional_attn_cg_support,
             copy_admitted_drafts_to_host=self.batch_sharder is not None,
         )
+        if (av_trace := self._av_trace()) is not None:
+            if getattr(self.speculator, "use_confidence_head", False):
+                av_trace.meta["confidence_source"] = "confidence_head"
+            elif getattr(self.speculator, "use_acceptance_estimator", False):
+                av_trace.meta["confidence_source"] = "acceptance_estimator"
+            else:
+                av_trace.meta["confidence_source"] = "speculator"
 
         self.block_tables = BlockTables(
             block_sizes=[g.block_size for g in kv_cache_groups],
@@ -1327,6 +1340,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             req_index = self.req_states.req_id_to_index[req_id]
             if self.adaptive_verification is not None:
                 self.adaptive_verification.add_request(req_index)
+                if (av_trace := self.adaptive_verification.trace) is not None:
+                    av_trace.log("request", force=True, req_id=req_id, row=req_index)
             if self.speculator is not None:
                 self.speculator.add_request(req_index, new_req_data)
 
@@ -1546,6 +1561,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_scheduled_tokens_upper_bound = num_scheduled_tokens_np
         num_admitted_draft_tokens = None
         if adaptive_verification is not None:
+            t_compact = (
+                time.perf_counter_ns() if adaptive_verification.trace is not None else 0
+            )
             # num_scheduled_tokens represents the draft budget evenly distributed across
             # all verification requests, `reallocate_drafts` will unevenly assign the
             # draft budget to requests on the GPU side only.
@@ -1556,6 +1574,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     cu_num_logits_np,
                 )
             )
+            if adaptive_verification.trace is not None:
+                adaptive_verification.trace.set_step_info(
+                    compact_us=(time.perf_counter_ns() - t_compact) / 1e3
+                )
 
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
@@ -1864,6 +1886,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         valid_dummy_state_slots: bool = False,
         randomize_inputs: bool = False,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        av_trace = None if dummy_run else self._av_trace()
+        if av_trace is not None:
+            av_trace.begin_step()
         if not dummy_run:
             self.draft_tokens_handler.begin_step(scheduler_output)
             # Update the request states.
@@ -1951,6 +1976,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if self.observability_config.cudagraph_metrics:
                 cudagraph_stats = make_cudagraph_stats(batch_desc, num_toks)
             assert batch_req_state is not None
+            if av_trace is not None:
+                av_trace.event("step_start")
             input_batch = self.prepare_inputs(
                 scheduler_output, batch_req_state, batch_desc, num_active_loras
             )
@@ -2158,6 +2185,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             input_batch, batch_desc.cg_mode == CUDAGraphMode.FULL
         )
         self.step_timing.forward_start()
+        if av_trace is not None:
+            av_trace.set_step_info(
+                cg_mode=batch_desc.cg_mode.name,
+                num_tokens=input_batch.num_tokens,
+                num_tokens_padded=input_batch.num_tokens_after_padding,
+                num_reqs=input_batch.num_reqs,
+                num_draft_tokens=input_batch.num_draft_tokens,
+            )
+            av_trace.event("forward_start")
 
         # Run model.
         if batch_desc.cg_mode == CUDAGraphMode.FULL:
@@ -2210,6 +2246,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     model_output = self.model(**model_inputs)
 
         self.kv_connector.finish_forward()
+        if av_trace is not None:
+            av_trace.event("forward_end")
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -2321,6 +2359,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         sampler_output, num_sampled, num_rejected = self.sample(
             hidden_states, input_batch, grammar_output
         )
+        av_trace = self._av_trace()
+        if av_trace is not None:
+            av_trace.event("sample_end")
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -2376,6 +2417,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             num_drafted_tokens_per_req=num_drafted_tokens_per_req,
             num_verified_tokens_per_req=num_verified_tokens_per_req,
         )
+        if av_trace is not None:
+            async_output.av_trace = av_trace
+            async_output.av_trace_step = av_trace.step
 
         # Collect KV transfer results now; finalize saves after the drafter runs.
         defer_kv_finalize = self.speculator is not None
@@ -2416,6 +2460,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if self.speculator is not None:
             assert self.sampler is not None
+            if av_trace is not None:
+                av_trace.event("drafter_start")
             if isinstance(self.speculator, DraftModelSpeculator):
                 self.speculator.prepare_propose(
                     input_batch, num_sampled, num_rejected, self.sampler
@@ -2444,6 +2490,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pcp_manager.sync_drafts(
                     draft_tokens, input_batch.idx_mapping, self.speculator.draft_logits
                 )
+            if av_trace is not None:
+                av_trace.event("drafter_end")
             if num_spec_tokens < self.num_speculative_steps:
                 draft_tokens[:, num_spec_tokens:] = -1
             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens

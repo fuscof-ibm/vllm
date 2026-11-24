@@ -24,6 +24,7 @@ from vllm.v1.worker.utils import raise_if_nan_logits
 if TYPE_CHECKING:
     from vllm.distributed.aux_output_connector.worker import PendingAuxOutput
     from vllm.v1.worker.gpu.input_batch import InputBatch
+    from vllm.v1.worker.gpu.spec_decode.av_trace import AVTracer
 
 
 @dataclass(frozen=True, slots=True)
@@ -136,6 +137,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.pending_aux_output = pending_aux_output
         self.num_drafted_tokens_per_req = num_drafted_tokens_per_req
         self.num_verified_tokens_per_req = num_verified_tokens_per_req
+        # Adaptive verification trace, set by the model runner when enabled.
+        self.av_trace: AVTracer | None = None
+        self.av_trace_step = 0
         # Blocking (sleep) event to avoid busy-polling the accelerator driver lock.
         self.copy_event = torch.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
@@ -207,6 +211,15 @@ class AsyncOutput(AsyncModelRunnerOutput):
             num_verified = self.num_verified_tokens_per_req_np.tolist()
             self.model_runner_output.num_drafted_tokens_per_req = num_drafted
             self.model_runner_output.num_verified_tokens_per_req = num_verified
+            if self.av_trace is not None:
+                self.av_trace.log(
+                    "outcome",
+                    step=self.av_trace_step,
+                    req_ids=list(self.model_runner_output.req_ids),
+                    num_drafted=num_drafted,
+                    num_verified=num_verified,
+                    num_sampled=num_sampled_tokens,
+                )
 
         if self.sampling_mask_tensors is not None:
             self.model_runner_output.sampling_masks = (

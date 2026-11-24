@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Adaptive verification for DSpark speculative decoding."""
 
+import time
 from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from typing import TYPE_CHECKING
@@ -23,6 +24,7 @@ from vllm.v1.worker.gpu.attn_utils import (
     get_query_lens_mismatch_unsupported_backend,
     get_varlen_cudagraph_unsupported_backend,
 )
+from vllm.v1.worker.gpu.spec_decode.av_trace import AVTracer
 
 logger = init_logger(__name__)
 _PROFILE_REPLAYS = 5
@@ -233,7 +235,9 @@ class AdaptiveVerificationManager:
         max_total_logits: int,
         copy_admitted_drafts_to_host: bool = False,
         max_concurrent_batches: int = 2,
+        trace: AVTracer | None = None,
     ):
+        self.trace = trace
         self.req_states = req_states
         self.num_speculative_steps = req_states.num_speculative_steps
         device = req_states.device
@@ -294,6 +298,9 @@ class AdaptiveVerificationManager:
         self._stale_idx = 0
         for slot in self._stale_confidences:
             slot.np.fill(1.0)
+        # Trace only: the step whose drafter produced each ring slot.
+        self._slot_source_step = [-1] * num_slots
+        self._capture_sizes: list[int] = []
 
     def warmup_budget_kernel(self) -> None:
         """JIT the draft-budget kernel so the first binding step doesn't compile."""
@@ -316,6 +323,7 @@ class AdaptiveVerificationManager:
         Run these inside StepTimingCollector.collect(), then hand the block's
         timings to set_initial_cost_curves."""
         max_num_tokens = self.req_states.max_num_batched_tokens
+        self._capture_sizes = list(capture_sizes)
         size = self._cudagraph_limit = capture_sizes[-1] if capture_sizes else 0
         # Also profile beyond the capture limit: real steps run there
         # (piecewise/eager) and linear extrapolation badly underestimates
@@ -377,22 +385,44 @@ class AdaptiveVerificationManager:
             self._cudagraph_limit,
         )
         logger.debug("DSpark cost tables: %s", self.cost_tables)
+        if self.trace is not None:
+            draft_table, verify_table = self.cost_tables
+            self.trace.log(
+                "meta",
+                force=True,
+                **self.trace.meta,
+                num_speculative_steps=self.num_speculative_steps,
+                num_bonus_tokens=self.num_bonus_tokens,
+                max_total_logits=self._max_total_logits,
+                max_num_reqs=self.req_states.max_num_reqs,
+                ring_depth=len(self._stale_confidences),
+                cudagraph_limit=self._cudagraph_limit,
+                capture_sizes=self._capture_sizes,
+                draft_curve=draft_curve,
+                verify_curve=verify_curve,
+                draft_table=draft_table,
+                verify_table=verify_table,
+            )
 
     def record_confidences(
         self, confidence_probs: torch.Tensor, input_batch: "InputBatch"
     ) -> None:
         """Publish this step's raw confidences for the ranking kernel and start
         copying them to the CPU, where a later step's budget reads them."""
+        t0 = time.perf_counter_ns() if self.trace is not None else 0
         num_reqs = input_batch.num_reqs
         ready_idx = (self._stale_idx + 1) % len(self._stale_confidences)
         with gpu_sync_allowed():
             self._copy_events[ready_idx].synchronize()
+        t_waited = time.perf_counter_ns() if self.trace is not None else 0
         if resets := self._pending_resets[ready_idx]:
             self._stale_confidences[ready_idx].np[resets] = 1.0
             resets.clear()
         # The oldest step's copy has landed: budgets read it, this step
         # overwrites the slot they were reading before.
         self._stale_idx, write_idx = ready_idx, self._stale_idx
+        if self.trace is not None:
+            self._slot_source_step[write_idx] = self.trace.step
 
         self._confidence_probs[input_batch.idx_mapping] = confidence_probs[:num_reqs]
         write_slot = self._stale_confidences[write_idx]
@@ -402,6 +432,18 @@ class AdaptiveVerificationManager:
         self._copy_stream.wait_stream(current_stream)
         with stream(self._copy_stream, current_stream):
             write_slot.copy_to_cpu()
+            if self.trace is not None:
+                # Copied before this slot's event: the ring's wait before it
+                # rewrites the staging buffer also covers this copy.
+                self.trace.copy_async(
+                    "fresh_conf",
+                    "conf",
+                    write_slot.gpu,
+                    input_batch.idx_mapping_np,
+                    req_ids=list(input_batch.req_ids),
+                    wait_us=(t_waited - t0) / 1e3,
+                    host_us=(time.perf_counter_ns() - t0) / 1e3,
+                )
             self._copy_events[write_idx].record()
 
     def get_num_tokens(
@@ -414,6 +456,7 @@ class AdaptiveVerificationManager:
         Stashes the chosen budget in `_batch_budget` for the compaction and
         reallocation that follow in the same step.
         """
+        t0 = time.perf_counter_ns() if self.trace is not None else 0
         assert self.cost_tables is not None
         req_ids = list(num_tokens_per_req)
         num_reqs = len(req_ids)
@@ -466,15 +509,35 @@ class AdaptiveVerificationManager:
             req_id: int(num_tokens)
             for req_id, num_tokens in zip(req_ids, num_non_draft_tokens, strict=True)
         }
-        draft_budget = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
+        b_local = int(np.argmax(num_tokens_to_estimated_accepted_tokens / costs))
         # Rank-local confidences must not select different TP execution sizes.
-        draft_budget = get_tp_group().broadcast_object(draft_budget, src=0)
+        draft_budget = get_tp_group().broadcast_object(b_local, src=0)
         self._batch_budget = (
             num_drafts_per_req,
             num_non_draft_tokens_per_req,
             draft_budget,
         )
-        return sum(num_non_draft_tokens_per_req.values()) + draft_budget
+        num_tokens = sum(num_non_draft_tokens_per_req.values()) + draft_budget
+        if self.trace is not None:
+            self.trace.log(
+                "decision",
+                req_ids=req_ids,
+                rows=slots,
+                scheduled_tokens=scheduled_tokens,
+                scheduled_drafts=scheduled_drafts,
+                num_non_draft=num_non_draft_tokens,
+                num_computed_tokens=self.req_states.num_computed_tokens_np[slots],
+                prefill_len=self.req_states.prefill_len.np[slots],
+                stale_conf=stale_confidences,
+                stale_source_step=self._slot_source_step[self._stale_idx],
+                max_draft_budget=max_draft_budget,
+                num_sampling=int(num_sampling_requests),
+                b_local=b_local,
+                b=draft_budget,
+                num_tokens=num_tokens,
+                host_us=(time.perf_counter_ns() - t0) / 1e3,
+            )
+        return num_tokens
 
     def compact_batch(
         self,
@@ -522,6 +585,7 @@ class AdaptiveVerificationManager:
         """The admitted draft counts are None unless copy_admitted_drafts_to_host
         is set and the budget binds; otherwise the host counts are already exact.
         """
+        t0 = time.perf_counter_ns() if self.trace is not None else 0
         batch_budget, self._batch_budget = self._batch_budget, None
         assert batch_budget is not None
         num_drafts_per_req, num_non_draft_tokens_per_req, draft_budget = batch_budget
@@ -547,6 +611,8 @@ class AdaptiveVerificationManager:
         else:
             async_tensor_h2d(scheduled_drafts, out=capacities)
             if draft_budget < int(scheduled_drafts.sum()):
+                if self.trace is not None:
+                    self.trace.event("kernel_start")
                 assign_draft_token_budget(
                     self._confidence_probs,
                     idx_mapping,
@@ -554,6 +620,8 @@ class AdaptiveVerificationManager:
                     draft_budget,
                     self._draft_survival,
                 )
+                if self.trace is not None:
+                    self.trace.event("kernel_end")
                 # Equal totals alone do not ensure identical request boundaries.
                 get_tp_group().broadcast(capacities, src=0)
 
@@ -585,6 +653,21 @@ class AdaptiveVerificationManager:
                 self._admitted_drafts_event.record()
             admitted_drafts = AdmittedDraftCounts(
                 admitted_cpu, self._admitted_drafts_event
+            )
+        if self.trace is not None:
+            total_scheduled = int(scheduled_drafts.sum())
+            if draft_budget == 0:
+                path = "zero"
+            elif draft_budget < total_scheduled:
+                path = "kernel"
+            else:
+                path = "full"
+            self.trace.log(
+                "split",
+                path=path,
+                b=draft_budget,
+                total_scheduled=total_scheduled,
+                host_us=(time.perf_counter_ns() - t0) / 1e3,
             )
         return (
             self._cu_num_logits[: num_reqs + 1],
@@ -649,6 +732,18 @@ def maybe_create_adaptive_verification_manager(
             "speculative config, or use a backend that does."
         )
 
+    spec_config = vllm_config.speculative_config
+    parallel_config = vllm_config.parallel_config
+    trace = AVTracer.maybe_create(
+        {
+            "model": vllm_config.model_config.model,
+            "spec_method": spec_config.method if spec_config is not None else None,
+            "tp_size": parallel_config.tensor_parallel_size,
+            "dp_rank": parallel_config.data_parallel_rank,
+            "max_concurrent_batches": vllm_config.max_concurrent_batches,
+        },
+        tp_rank=get_tp_group().rank_in_group,
+    )
     return AdaptiveVerificationManager(
         req_states,
         query_start_loc,
@@ -656,4 +751,5 @@ def maybe_create_adaptive_verification_manager(
         max_total_logits=max_total_logits,
         copy_admitted_drafts_to_host=copy_admitted_drafts_to_host,
         max_concurrent_batches=vllm_config.max_concurrent_batches,
+        trace=trace,
     )
