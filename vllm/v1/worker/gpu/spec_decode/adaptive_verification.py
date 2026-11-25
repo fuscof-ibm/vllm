@@ -227,6 +227,9 @@ class AdmittedDraftCounts:
 
 
 class AdaptiveVerificationManager:
+    # Class default so instances built without __init__ (tests) stay untraced.
+    trace: AVTracer | None = None
+
     def __init__(
         self,
         req_states: "RequestState",
