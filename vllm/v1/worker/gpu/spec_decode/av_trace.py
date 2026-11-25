@@ -58,6 +58,10 @@ class AVTracer:
     """Collects trace records of one DP rank and writes them as JSONL."""
 
     @staticmethod
+    def enabled() -> bool:
+        return bool(os.environ.get("VLLM_AV_TRACE_DIR"))
+
+    @staticmethod
     def maybe_create(meta: dict[str, Any], tp_rank: int) -> "AVTracer | None":
         out_dir = os.environ.get("VLLM_AV_TRACE_DIR")
         if not out_dir or tp_rank != 0:

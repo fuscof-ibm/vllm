@@ -735,18 +735,20 @@ def maybe_create_adaptive_verification_manager(
             "speculative config, or use a backend that does."
         )
 
-    spec_config = vllm_config.speculative_config
-    parallel_config = vllm_config.parallel_config
-    trace = AVTracer.maybe_create(
-        {
-            "model": vllm_config.model_config.model,
-            "spec_method": spec_config.method if spec_config is not None else None,
-            "tp_size": parallel_config.tensor_parallel_size,
-            "dp_rank": parallel_config.data_parallel_rank,
-            "max_concurrent_batches": vllm_config.max_concurrent_batches,
-        },
-        tp_rank=get_tp_group().rank_in_group,
-    )
+    trace = None
+    if AVTracer.enabled():
+        spec_config = vllm_config.speculative_config
+        parallel_config = vllm_config.parallel_config
+        trace = AVTracer.maybe_create(
+            {
+                "model": vllm_config.model_config.model,
+                "spec_method": spec_config.method if spec_config is not None else None,
+                "tp_size": parallel_config.tensor_parallel_size,
+                "dp_rank": parallel_config.data_parallel_rank,
+                "max_concurrent_batches": vllm_config.max_concurrent_batches,
+            },
+            tp_rank=get_tp_group().rank_in_group,
+        )
     return AdaptiveVerificationManager(
         req_states,
         query_start_loc,
